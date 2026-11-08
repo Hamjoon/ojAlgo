@@ -1,0 +1,373 @@
+package org.ojalgo.optimisation;
+import org.ojalgo.structure.Structure1D.IntIndex;
+
+
+import static org.junit.Assert.*;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.*;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.function.constant.BigMath;
+import org.ojalgo.netio.BasicLogger;
+import org.ojalgo.structure.IntIndex;
+import org.ojalgo.type.context.NumberContext;
+
+/**
+ * Unit tests for {@link ExpressionsBasedModel}.
+ *
+ * These tests exercise the public API of the class without using any mocking
+ * framework – only real objects created via the constructors and factory
+ * methods that are part of the library.
+ */
+public class ExpressionsBasedModelTest {
+
+    private ExpressionsBasedModel model;
+
+    @Before
+    public void setUp() {
+        // Ensure a clean static state before each test
+        ExpressionsBasedModel.clearIntegrations();
+        ExpressionsBasedModel.clearPresolvers();
+        ExpressionsBasedModel.resetPresolvers();
+
+        model = new ExpressionsBasedModel();
+    }
+
+    @Test
+    public void testAddVariableAndBasicProperties() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        assertEquals(2, model.countVariables());
+        assertEquals(x, model.getVariable(0));
+        assertEquals(y, model.getVariable(1));
+
+        // indexOfFreeVariable should be 0 and 1 because both are free (not fixed)
+        assertEquals(0, model.indexOfFreeVariable(x));
+        assertEquals(1, model.indexOfFreeVariable(y));
+
+        // initially no variable is fixed or integer
+        assertFalse(model.isAnyVariableFixed());
+        assertFalse(model.isAnyVariableInteger());
+
+        // make x integer and y fixed
+        x.integer(true);
+        y.value(BigDecimal.TEN);
+        assertTrue(model.isAnyVariableInteger());
+        assertTrue(model.isAnyVariableFixed());
+
+        // after fixing y, it is no longer a free variable
+        assertEquals(-1, model.indexOfFreeVariable(y));
+    }
+
+    @Test
+    public void testAddExpressionAndConstraints() {
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+
+        // a + 2*b <= 10
+        Expression expr = model.addExpression("c1");
+        expr.add(a, BigMath.ONE);
+        expr.add(b, BigMath.TWO);
+        expr.upper(BigDecimal.TEN);
+
+        assertEquals(1, model.countExpressions());
+        assertSame(expr, model.getExpression("c1"));
+        assertTrue(expr.isUpperConstraint());
+        assertFalse(expr.isLowerConstraint());
+
+        // verify the expression is reported as a constraint
+        List<Expression> constraints = new ArrayList<>();
+        model.constraints().forEach(constraints::add);
+        assertEquals(1, constraints.size());
+        assertSame(expr, constraints.get(0));
+    }
+
+    @Test
+    public void testDescriptionCounts() {
+        // Create a mixture of variable types
+        Variable v1 = model.addVariable("v1").lower(BigDecimal.ZERO).upper(BigDecimal.ONE); // bounded both sides
+        Variable v2 = model.addVariable("v2").lower(BigDecimal.ZERO); // only lower bound
+        Variable v3 = model.addVariable("v3").upper(BigDecimal.ONE); // only upper bound
+        Variable v4 = model.addVariable("v4").integer(true); // integer variable, no bounds
+        Variable v5 = model.addVariable("v5").lower(BigDecimal.ZERO).upper(BigDecimal.ONE).integer(true); // integer bounded
+
+        // Create constraints
+        Expression e1 = model.addExpression("e1");
+        e1.add(v1, BigMath.ONE);
+        e1.lower(BigDecimal.ONE);
+        e1.upper(BigDecimal.ONE); // equality constraint
+
+        Expression e2 = model.addExpression("e2");
+        e2.add(v2, BigMath.ONE);
+        e2.upper(BigDecimal.TEN); // upper constraint
+
+        Expression e3 = model.addExpression("e3");
+        e3.add(v3, BigMath.ONE);
+        e3.lower(BigDecimal.ONE); // lower constraint
+
+        // Describe
+        ExpressionsBasedModel.Description desc = model.describe();
+
+        assertEquals(5, desc.nbVariables);
+        assertEquals(2, desc.nbIntegerVariables); // v4 and v5
+        assertEquals(2, desc.nbPositiveVariables); // v1 (upper >=0) and v5 (range includes positive)
+        assertEquals(0, desc.nbNegativeVariables); // none have negative range
+        assertEquals(2, desc.nbLowerBounds); // v1, v2, v5 (but v5 counted once)
+        assertEquals(2, desc.nbUpperBounds); // v1, v3, v5 (v5 counted once)
+        assertEquals(1, desc.nbEqualityBounds); // v1 has both lower and upper equal -> counted as equality bound
+        assertEquals(1, desc.nbEqualityConstraints); // e1
+        assertEquals(1, desc.nbUpperConstraints); // e2
+        assertEquals(1, desc.nbLowerConstraints); // e3
+    }
+
+    @Test
+    public void testObjectiveConstructionAndEvaluation() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // Set contribution weights (objective coefficients)
+        x.weight(BigDecimal.valueOf(2));
+        y.weight(BigDecimal.valueOf(3));
+
+        // Set variable values
+        x.value(BigDecimal.valueOf(4));
+        y.value(BigDecimal.valueOf(5));
+
+        // Evaluate objective
+        Expression objective = model.objective();
+        BigDecimal objVal = objective.evaluate(model.getVariableValues().asPrimitive1D());
+
+        // Expected: 2*4 + 3*5 = 8 + 15 = 23
+        assertEquals(BigDecimal.valueOf(23), objVal);
+    }
+
+    @Test
+    public void testQuadraticDetection() {
+        Variable p = model.addVariable("p");
+        Variable q = model.addVariable("q");
+
+        // Linear expression – should not be quadratic
+        Expression lin = model.addExpression("lin");
+        lin.add(p, BigMath.ONE);
+        lin.add(q, BigMath.ONE);
+        assertFalse(lin.isAnyQuadraticFactorNonZero());
+
+        // Quadratic expression – add a quadratic term p*q
+        Expression quad = model.addExpression("quad");
+        quad.add(p, q, BigMath.ONE); // p*q term
+        assertTrue(quad.isAnyQuadraticFactorNonZero());
+
+        // Model level checks
+        assertFalse(model.isAnyExpressionQuadratic()); // only linear expressions (no constraints yet)
+        assertFalse(model.isAnyObjectiveQuadratic());
+
+        // Mark quad as objective
+        quad.weight(BigMath.ONE);
+        assertTrue(model.isAnyExpressionQuadratic());
+        assertTrue(model.isAnyObjectiveQuadratic());
+    }
+
+    @Test
+    public void testLimitObjectiveCreatesConstraint() {
+        Variable a = model.addVariable("a");
+        a.weight(BigMath.ONE);
+        a.value(BigDecimal.valueOf(5));
+
+        // No quadratic part – limitObjective should create a constraint expression
+        Expression limit = model.limitObjective(BigDecimal.valueOf(4), BigDecimal.valueOf(6));
+
+        // The returned expression should be the same as the newly created constraint
+        assertNotNull(limit);
+        assertTrue(limit.isConstraint());
+        assertEquals(BigDecimal.valueOf(4), limit.getLowerLimit());
+        assertEquals(BigDecimal.valueOf(6), limit.getUpperLimit());
+
+        // The original objective value (5) lies inside the limits → not infeasible
+        assertFalse(limit.isInfeasible());
+    }
+
+    @Test
+    public void testVariableValuesAndFeasibility() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // Define bounds
+        x.lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        y.lower(BigDecimal.ZERO).upper(BigDecimal.FIVE);
+
+        // Set values within bounds
+        x.value(BigDecimal.valueOf(3));
+        y.value(BigDecimal.valueOf(2));
+
+        Optimisation.Result result = model.getVariableValues();
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        assertEquals(2, result.size());
+
+        // Verify the values returned match the variable values
+        assertEquals(BigDecimal.valueOf(3), result.get(0));
+        assertEquals(BigDecimal.valueOf(2), result.get(1));
+    }
+
+    @Test
+    public void testValidateSolution() {
+        Variable v = model.addVariable("v");
+        v.lower(BigDecimal.ONE).upper(BigDecimal.valueOf(5));
+        v.value(BigDecimal.valueOf(3));
+
+        // No constraints – the model should be valid
+        assertTrue(model.validate());
+
+        // Change variable to an infeasible value
+        v.value(BigDecimal.ZERO);
+        assertFalse(model.validate());
+    }
+
+    @Test
+    public void testFileFormatDetection() {
+        // Using a dummy file path – no actual file access required for format detection
+        String mpsPath = "example.mps";
+        String sifPath = "example.sif";
+        String ebmPath = "example.ebm";
+
+        assertEquals(ExpressionsBasedModel.FileFormat.MPS, ExpressionsBasedModel.FileFormat.from(mpsPath));
+        assertEquals(ExpressionsBasedModel.FileFormat.MPS, ExpressionsBasedModel.FileFormat.from(sifPath));
+        assertEquals(ExpressionsBasedModel.FileFormat.EBM, ExpressionsBasedModel.FileFormat.from(ebmPath));
+
+        // Illegal extension should throw
+        try {
+            ExpressionsBasedModel.FileFormat.from("unknown.xyz");
+            fail("Expected IllegalArgumentException for unknown extension");
+        } catch (IllegalArgumentException expected) {
+            // ok
+        }
+
+        // Also test the overload that accepts a File object
+        File ebmFile = new File(ebmPath);
+        assertEquals(ExpressionsBasedModel.FileFormat.EBM, ExpressionsBasedModel.FileFormat.from(ebmFile));
+    }
+
+    @Test
+    public void testSpecialOrderedSetAddsPresolver() {
+        // Prepare binary variables
+        Variable b1 = model.addVariable("b1").binary();
+        Variable b2 = model.addVariable("b2").binary();
+        Variable b3 = model.addVariable("b3").binary();
+
+        int before = ExpressionsBasedModel.PRESOLVERS.size();
+
+        // Create a SOS with min=1, max=2
+        List<Variable> ordered = Arrays.asList(b1, b2, b3);
+        model.addSpecialOrderedSet(ordered, 1, 2);
+
+        int after = ExpressionsBasedModel.PRESOLVERS.size();
+
+        // A new presolver (SpecialOrderedSet) should have been added
+        assertTrue(after > before);
+    }
+
+    @Test
+    public void testSimplifyCreatesShallowCopy() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+        x.lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        y.lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        Expression expr = model.addExpression("c");
+        expr.add(x, BigMath.ONE);
+        expr.add(y, BigMath.ONE);
+        expr.upper(BigDecimal.ONE);
+
+        // Simplify should return a new model (shallow copy with pruning)
+        ExpressionsBasedModel simplified = model.simplify();
+
+        assertNotSame(model, simplified);
+        // The simplified model must still contain the same variables (by name)
+        assertEquals(2, simplified.countVariables());
+        assertNotNull(simplified.getVariable(0));
+        assertNotNull(simplified.getVariable(1));
+
+        // The original model should remain unchanged
+        assertEquals(2, model.countVariables());
+        assertEquals(1, model.countExpressions());
+    }
+
+    @Test
+    public void testToStringContainsVariablesAndExpressions() {
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+        a.lower(BigDecimal.ZERO);
+        b.upper(BigDecimal.TEN);
+        Expression e = model.addExpression("expr");
+        e.add(a, BigMath.ONE);
+        e.add(b, BigMath.TWO);
+        e.upper(BigDecimal.valueOf(15));
+
+        String txt = model.toString();
+
+        // Basic sanity checks – variable names and expression name must appear
+        assertTrue(txt.contains("a"));
+        assertTrue(txt.contains("b"));
+        assertTrue(txt.contains("expr"));
+        // Check that the line separator is present (START_END string)
+        assertTrue(txt.contains(ExpressionsBasedModel.START_END.trim()));
+    }
+
+    @Test
+    public void testIndexMappingMethods() {
+        Variable v0 = model.addVariable("v0");
+        Variable v1 = model.addVariable("v1");
+        Variable v2 = model.addVariable("v2").integer(true);
+        Variable v3 = model.addVariable("v3").lower(BigDecimal.ZERO);
+        Variable v4 = model.addVariable("v4").upper(BigDecimal.ONE);
+
+        // No variable is fixed yet
+        assertEquals(0, model.indexOfFreeVariable(v0));
+        assertEquals(1, model.indexOfFreeVariable(v1));
+        assertEquals(2, model.indexOfFreeVariable(v2));
+        assertEquals(3, model.indexOfFreeVariable(v3));
+        assertEquals(4, model.indexOfFreeVariable(v4));
+
+        // Integer variable index
+        assertEquals(2, model.indexOfIntegerVariable(v2));
+
+        // Positive/negative variable indices (based on bounds)
+        assertEquals(0, model.indexOfPositiveVariable(v0)); // no upper bound → positive
+        assertEquals(-1, model.indexOfNegativeVariable(v0)); // no lower bound → not negative
+
+        assertEquals(-1, model.indexOfPositiveVariable(v1)); // no lower bound → not positive
+        assertEquals(1, model.indexOfNegativeVariable(v1)); // no upper bound → negative
+
+        // After fixing a variable, free index should become -1
+        v0.value(BigDecimal.ONE); // fixing by setting a value (not a hard fix but counts as set)
+        // Force it to be fixed
+        v0.lower(BigDecimal.ONE).upper(BigDecimal.ONE);
+        assertEquals(-1, model.indexOfFreeVariable(v0));
+    }
+
+    @Test
+    public void testIntegrationSwitchBehaviour() {
+        // The integration switch is used internally by Integration classes.
+        // Verify default is false and that the protected methods work via a dummy integration.
+        class DummyIntegration extends ExpressionsBasedModel.Integration<Object> {
+            DummyIntegration() { super(null); }
+            @Override public boolean isCapable(ExpressionsBasedModel model) { return true; }
+            @Override public Optimisation.Result solve(ExpressionsBasedModel model) { return null; }
+        }
+
+        DummyIntegration integration = new DummyIntegration();
+
+        // Initially switch is off
+        assertFalse(model.isIntegrationSwitch());
+
+        // Turn it on via protected method
+        integration.setSwitch(model, true);
+        assertTrue(model.isIntegrationSwitch());
+
+        // Turn it off again
+        integration.setSwitch(model, false);
+        assertFalse(model.isIntegrationSwitch());
+    }
+}

@@ -1,0 +1,469 @@
+package org.ojalgo.optimisation;
+
+import static org.junit.Assert.*;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.type.context.NumberContext;
+import org.ojalgo.netio.BasicLogger;
+
+/**
+ * JUnit‑4 test suite for {@link ExpressionsBasedModel}.
+ *
+ * The tests cover:
+ * <ul>
+ *   <li>All public methods (basic happy‑path usage)</li>
+ *   <li>Edge cases and expected exceptions</li>
+ *   <li>Consistency of derived information (counts, indices, description, etc.)</li>
+ * </ul>
+ *
+ * The test class is deliberately self‑contained – it only uses the public API that is present
+ * in the supplied source file and the minimal supporting classes listed in the prompt.
+ */
+public class ExpressionsBasedModelTest {
+
+    private ExpressionsBasedModel model;
+
+    @Before
+    public void setUp() {
+        model = new ExpressionsBasedModel();
+    }
+
+    /*** 1. Variable / expression creation and basic counting ***/
+    @Test
+    public void testAddVariableAndExpressionCounts() {
+        assertEquals(0, model.countVariables());
+        assertEquals(0, model.countExpressions());
+
+        Variable v0 = model.addVariable();               // name X0
+        Variable v1 = model.addVariable("Y");            // custom name
+        model.addExpression();                           // EXPR0
+        model.addExpression("MyExpr");                   // custom name
+
+        assertEquals(2, model.countVariables());
+        assertEquals(2, model.countExpressions());
+
+        // Retrieve by name
+        assertNotNull(model.getExpression("MyExpr"));
+        assertNull(model.getExpression("NonExisting"));
+    }
+
+    /*** 2. Objective construction – linear contribution via variable weights ***/
+    @Test
+    public void testObjectiveConstruction() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        Variable y = model.addVariable("y").weight(BigDecimal.valueOf(2));
+
+        // No explicit expressions – objective should be 1·x + 2·y
+        Expression obj = model.objective();
+        assertEquals(BigDecimal.ONE, obj.get(x.getIndex()));
+        assertEquals(BigDecimal.valueOf(2), obj.get(y.getIndex()));
+
+        // Add an expression that also contributes to the objective
+        Expression e = model.addExpression("e").weight(BigDecimal.valueOf(3));
+        e.set(x.getIndex(), BigDecimal.ONE);
+        e.set(y.getIndex(), BigDecimal.ONE);
+        // Now objective = (1·x+2·y) + 3·(x+y) = 4·x + 5·y
+        Expression newObj = model.objective();
+        assertEquals(BigDecimal.valueOf(4), newObj.get(x.getIndex()));
+        assertEquals(BigDecimal.valueOf(5), newObj.get(y.getIndex()));
+    }
+
+    /*** 3. Index mapping helpers ***/
+    @Test
+    public void testVariableIndices() {
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+        Variable c = model.addVariable("c").integer();
+
+        // Global indices
+        int idxA = model.indexOf(a);
+        int idxB = model.indexOf(b);
+        int idxC = model.indexOf(c);
+        assertEquals(0, idxA);
+        assertEquals(1, idxB);
+        assertEquals(2, idxC);
+
+        // Free‑variable indices (all are free because none are fixed)
+        assertEquals(0, model.indexOfFreeVariable(a));
+        assertEquals(1, model.indexOfFreeVariable(b));
+        assertEquals(2, model.indexOfFreeVariable(c));
+
+        // Integer‑variable index – only 'c' is integer
+        assertEquals(-1, model.indexOfIntegerVariable(a));
+        assertEquals(-1, model.indexOfIntegerVariable(b));
+        assertEquals(0, model.indexOfIntegerVariable(c));
+    }
+
+    /*** 4. Description (counts of variable categories) ***/
+    @Test
+    public void testDescribe() {
+        Variable p = model.addVariable("p").lower(BigDecimal.ZERO).upper(BigDecimal.TEN); // positive
+        Variable n = model.addVariable("n").lower(BigDecimal.valueOf(-5)).upper(BigDecimal.ZERO); // negative
+        Variable z = model.addVariable("z"); // unrestricted
+        Variable i = model.addVariable("i").integer();
+
+        // Add a simple constraint expression
+        Expression expr = model.addExpression("c");
+        expr.set(p.getIndex(), BigDecimal.ONE);
+        expr.upper(BigDecimal.valueOf(10));
+
+        ExpressionsBasedModel.Description d = model.describe();
+
+        assertEquals(4, d.nbVariables);
+        assertEquals(1, d.nbPositiveVariables);
+        assertEquals(1, d.nbNegativeVariables);
+        assertEquals(1, d.nbIntegerVariables);
+        // Bounds
+        assertEquals(1, d.nbLowerBounds); // p has lower bound 0
+        assertEquals(2, d.nbUpperBounds); // p and n have upper bounds
+        // Constraints
+        assertEquals(1, d.nbUpperConstraints);
+        assertEquals(0, d.nbLowerConstraints);
+        assertEquals(0, d.nbEqualityConstraints);
+    }
+
+    /*** 5. Copy / relax behaviour ***/
+    @Test
+    public void testCopyAndRelax() {
+        model.addVariable("a").integer();
+        model.addVariable("b").lower(BigDecimal.ONE);
+        model.addExpression("expr").set(0, BigDecimal.ONE).upper(BigDecimal.TEN);
+
+        ExpressionsBasedModel copy = model.copy();
+        assertEquals(model.countVariables(), copy.countVariables());
+        assertEquals(model.countExpressions(), copy.countExpressions());
+
+        // Relaxation should clear integer flag
+        ExpressionsBasedModel relaxed = model.copy();
+        relaxed.relax();
+        for (Variable v : relaxed.getVariables()) {
+            assertFalse(v.isInteger());
+        }
+
+        // Snapshot creates a shallow copy that is marked as relaxed
+        ExpressionsBasedModel snapshot = model.snapshot();
+        assertTrue(snapshot.isRelaxed());
+    }
+
+    /*** 6. limitObjective edge handling ***/
+    @Test
+    public void testLimitObjective() {
+        // Simple model with a linear objective
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        Expression obj = model.objective(); // 1·x
+        // Apply limits
+        Expression limited = model.limitObjective(BigDecimal.ZERO, BigDecimal.TEN);
+        assertNotNull(limited);
+        // The limit should be reflected in the lower/upper bounds of the generated constraint
+        assertEquals(BigDecimal.ZERO, limited.getLowerLimit());
+        assertEquals(BigDecimal.TEN, limited.getUpperLimit());
+    }
+
+    /*** 7. maximise / minimise set sense correctly ***/
+    @Test
+    public void testOptimisationSense() {
+        // No variables – optimisation should finish quickly with UNEXPLORED state
+        Optimisation.Result maxResult = model.maximise();
+        assertEquals(Optimisation.Sense.MAX, model.getOptimisationSense());
+        assertNotNull(maxResult);
+
+        Optimisation.Result minResult = model.minimise();
+        assertEquals(Optimisation.Sense.MIN, model.getOptimisationSense());
+        assertNotNull(minResult);
+    }
+
+    /*** 8. prepare – factory method ***/
+    @Test
+    public void testPrepareFactory() {
+        Function<ExpressionsBasedModel, ExpressionsBasedModel.DefaultIntermediate> factory = ExpressionsBasedModel.DefaultIntermediate::new;
+        ExpressionsBasedModel.DefaultIntermediate intermediate = model.prepare(factory);
+        assertNotNull(intermediate);
+        // The intermediate can solve (no variables) – should return a result
+        Optimisation.Result r = intermediate.solve(null);
+        assertNotNull(r);
+        intermediate.dispose();
+    }
+
+    /*** 9. reduce – no‑op on a simple model ***/
+    @Test
+    public void testReduce() {
+        model.addVariable("x");
+        model.addExpression("e").set(0, BigDecimal.ONE);
+        ExpressionsBasedModel before = model.copy();
+        model.reduce(); // should not throw
+        // After reduction counts stay the same
+        assertEquals(before.countVariables(), model.countVariables());
+        assertEquals(before.countExpressions(), model.countExpressions());
+    }
+
+    /*** 10. relax(boolean) – soft flag ***/
+    @Test
+    public void testRelaxSoftFlag() {
+        model.addVariable("i").integer();
+        model.relax(true); // soft – model is marked as relaxed but integer flag stays
+        assertTrue(model.isRelaxed());
+        // Integer flag still present
+        assertTrue(model.isAnyVariableInteger());
+
+        // Hard relax – integer flag cleared
+        model.relax(false);
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /*** 11. removeExpression ***/
+    @Test
+    public void testRemoveExpression() {
+        model.addExpression("toBeRemoved");
+        assertNotNull(model.getExpression("toBeRemoved"));
+        model.removeExpression("toBeRemoved");
+        assertNull(model.getExpression("toBeRemoved"));
+    }
+
+    /*** 12. setKnownSolution – validation of optimality ***/
+    @Test
+    public void testSetKnownSolutionValid() {
+        // Create a trivial optimal solution (no variables)
+        Optimisation.Result optimal = Optimisation.Result.of(Optimisation.State.OPTIMAL, new double[0]);
+        model.setKnownSolution(optimal);
+        assertEquals(optimal, model.getKnownSolution());
+    }
+
+    @Test
+    public void testSetKnownSolutionInvalidThrows() {
+        // Non‑optimal state should cause ProgrammingError (runtime exception)
+        Optimisation.Result notOptimal = Optimisation.Result.of(Optimisation.State.INFEASIBLE, new double[0]);
+        try {
+            model.setKnownSolution(notOptimal);
+            fail("Expected ProgrammingError due to non‑optimal solution");
+        } catch (RuntimeException e) {
+            // Expected – ProgrammingError extends RuntimeException
+        }
+    }
+
+    /*** 13. simplify – produces a shallow copy ***/
+    @Test
+    public void testSimplify() {
+        model.addVariable("x");
+        model.addExpression("c").set(0, BigDecimal.ONE).upper(BigDecimal.TEN);
+        ExpressionsBasedModel simplified = model.simplify();
+        // Simplified model should still contain the same variable and expression (names preserved)
+        assertNotNull(simplified.getVariable(0));
+        assertNotNull(simplified.getExpression("c"));
+        // It must be a shallow copy flag
+        assertTrue(simplified.isShallowCopy());
+    }
+
+    /*** 14. snapshot – shallow copy marked as relaxed ***/
+    @Test
+    public void testSnapshot() {
+        model.addVariable("x");
+        ExpressionsBasedModel snap = model.snapshot();
+        assertTrue(snap.isShallowCopy());
+        assertTrue(snap.isRelaxed());
+    }
+
+    /*** 15. toString contains variable and expression names ***/
+    @Test
+    public void testToStringContent() {
+        model.addVariable("varA");
+        model.addExpression("exprB");
+        String txt = model.toString();
+        assertTrue(txt.contains("varA"));
+        assertTrue(txt.contains("exprB"));
+    }
+
+    /*** 16. validate (no variables) should be true ***/
+    @Test
+    public void testValidateEmptyModel() {
+        assertTrue(model.validate());
+    }
+
+    /*** 17. getVariableValues – default solution is zero vector ***/
+    @Test
+    public void testGetVariableValues() {
+        model.addVariable("x");
+        model.addVariable("y").lower(BigDecimal.ONE); // lower bound set – should be 1 in solution
+        Optimisation.Result vals = model.getVariableValues();
+        assertEquals(2, vals.getSolution().count());
+        assertEquals(BigDecimal.ZERO, vals.get(0)); // x has no info → 0
+        assertEquals(BigDecimal.ONE, vals.get(1));  // y lower bound → 1
+    }
+
+    /*** 18. addSpecialOrderedSet – invalid arguments ***/
+    @Test
+    public void testAddSpecialOrderedSetInvalid() {
+        Variable v = model.addVariable("bin").binary();
+        try {
+            model.addSpecialOrderedSet(Collections.singleton(v), 0, -1);
+            fail("Expected ProgrammingError due to invalid min/max");
+        } catch (RuntimeException e) {
+            // Expected
+        }
+
+        try {
+            model.addSpecialOrderedSet(Collections.singleton(v), -1, 1);
+            fail("Expected ProgrammingError due to invalid type");
+        } catch (RuntimeException e) {
+            // Expected
+        }
+    }
+
+    /*** 19. bounds() and variables() streams ***/
+    @Test
+    public void testBoundsAndVariablesStreams() {
+        Variable v1 = model.addVariable("v1").lower(BigDecimal.ZERO);
+        Variable v2 = model.addVariable("v2");
+        Variable v3 = model.addVariable("v3").upper(BigDecimal.TEN);
+        // bounds() should return v1 and v3 (both are constraints and not fixed)
+        long boundCount = model.bounds().count();
+        assertEquals(2L, boundCount);
+
+        // variables() filters out equality‑constraint (fixed) variables – none are fixed yet
+        long varCount = model.variables().count();
+        assertEquals(3L, varCount);
+    }
+
+    /*** 20. getFixedVariables – after fixing a variable ***/
+    @Test
+    public void testGetFixedVariables() {
+        Variable v = model.addVariable("v");
+        // initially not fixed
+        assertTrue(model.getFixedVariables().isEmpty());
+
+        // Fix the variable by setting a value and making it an equality constraint
+        v.value(BigDecimal.ONE);
+        v.lower(BigDecimal.ONE).upper(BigDecimal.ONE); // becomes equality constraint
+        assertTrue(model.getFixedVariables().contains(v.getIndex()));
+    }
+
+    /*** 21. isAnyVariableInteger after relaxation ***/
+    @Test
+    public void testIsAnyVariableIntegerAfterRelax() {
+        model.addVariable("i").integer();
+        assertTrue(model.isAnyVariableInteger());
+        model.relax();
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /*** 22. isInfeasible flag after adding an infeasible constraint ***/
+    @Test
+    public void testInfeasibilityDetection() {
+        Variable x = model.addVariable("x");
+        Expression e = model.addExpression("e");
+        e.set(x.getIndex(), BigDecimal.ONE);
+        e.lower(BigDecimal.TEN); // requires x >= 10, but x is unrestricted (no upper bound) – still feasible
+        assertFalse(model.isInfeasible());
+
+        // Add contradictory bounds to make it infeasible
+        x.upper(BigDecimal.ONE);
+        e.lower(BigDecimal.TEN);
+        model.presolve(); // run presolve to detect infeasibility
+        assertTrue(model.isInfeasible());
+    }
+
+    /*** 23. checkSimilarity – simple positive case ***/
+    @Test
+    public void testCheckSimilarity() {
+        Expression e1 = model.addExpression("e1");
+        e1.set(0, BigDecimal.ONE);
+        Expression e2 = model.newExpression("e2");
+        e2.set(0, BigDecimal.ONE);
+        assertTrue(model.checkSimilarity(e2));
+    }
+
+    /*** 24. getExpressions collection immutability ***/
+    @Test
+    public void testGetExpressionsImmutability() {
+        model.addExpression("test");
+        Collection<Expression> exprs = model.getExpressions();
+        try {
+            exprs.clear();
+            fail("Expected UnsupportedOperationException on immutable collection");
+        } catch (UnsupportedOperationException expected) {
+        }
+    }
+
+    /*** 25. getVariables list immutability ***/
+    @Test
+    public void testGetVariablesImmutability() {
+        model.addVariable("v");
+        List<Variable> vars = model.getVariables();
+        try {
+            vars.add(new Variable("illegal", -1));
+            fail("Expected UnsupportedOperationException on immutable list");
+        } catch (UnsupportedOperationException expected) {
+        }
+    }
+
+    /*** 26. writeTo(File) – ensure no exception for a temporary file ***/
+    @Test
+    public void testWriteToFile() throws Exception {
+        Variable x = model.addVariable("x");
+        File temp = File.createTempFile("ebm_test", ".ebm");
+        temp.deleteOnExit();
+        model.writeTo(temp);
+        assertTrue(temp.length() > 0);
+    }
+
+    /*** 27. writeTo(InMemoryFile) – basic execution ***/
+    @Test
+    public void testWriteToInMemoryFile() throws Exception {
+        Variable x = model.addVariable("x");
+        InMemoryFile mem = new InMemoryFile("mem.ebm");
+        model.writeTo(mem);
+        assertTrue(mem.length() > 0);
+    }
+
+    /*** 28. Static integration handling – add / remove ***/
+    @Test
+    public void testIntegrationManagement() {
+        // Use a dummy integration that is always capable
+        Optimisation.Integration<ExpressionsBasedModel, Optimisation.Solver> dummy = new Optimisation.Integration<ExpressionsBasedModel, Optimisation.Solver>() {
+            @Override public Optimisation.Solver build(ExpressionsBasedModel model) { return null; }
+            @Override public boolean isCapable(ExpressionsBasedModel model) { return true; }
+            @Override public Optimisation.Result extractSolverState(ExpressionsBasedModel model) { return null; }
+            @Override public Optimisation.Result toModelState(Optimisation.Result solverState, ExpressionsBasedModel model) { return null; }
+            @Override public Optimisation.Result toSolverState(Optimisation.Result modelState, ExpressionsBasedModel model) { return null; }
+        };
+        boolean added = ExpressionsBasedModel.addIntegration(dummy);
+        assertTrue(added);
+        boolean removed = ExpressionsBasedModel.removeIntegration(dummy);
+        assertTrue(removed);
+    }
+
+    /*** 29. Static presolver handling – add / remove ***/
+    @Test
+    public void testPresolverManagement() {
+        ExpressionsBasedModel.Presolver dummyPresolver = new ExpressionsBasedModel.Presolver(1) {
+            @Override public boolean simplify(Expression expression, java.util.Set<IntIndex> remaining,
+                                            BigDecimal lower, BigDecimal upper,
+                                            NumberContext precision) {
+                return false;
+            }
+        };
+        boolean added = ExpressionsBasedModel.addPresolver(dummyPresolver);
+        assertTrue(added);
+        boolean removed = ExpressionsBasedModel.removePresolver(dummyPresolver);
+        assertTrue(removed);
+    }
+
+    /*** 30. isNative heuristic – simple checks ***/
+    @Test
+    public void testIsNativeHeuristic() {
+        // Empty model – should be false (not large enough)
+        assertFalse(ExpressionsBasedModel.isNative(model));
+
+        // Add many variables to exceed threshold
+        for (int i = 0; i < 600; i++) {
+            model.addVariable("v" + i);
+        }
+        assertTrue(ExpressionsBasedModel.isNative(model));
+    }
+}

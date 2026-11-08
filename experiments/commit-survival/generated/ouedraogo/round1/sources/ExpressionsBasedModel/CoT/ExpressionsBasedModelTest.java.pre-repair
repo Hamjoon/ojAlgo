@@ -1,0 +1,458 @@
+package org.ojalgo.optimisation;
+
+import static org.junit.Assert.*;
+
+import java.io.File;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.type.context.NumberContext;
+import org.ojalgo.netio.BasicLogger;
+
+/**
+ * JUnit‑4 test suite for {@link ExpressionsBasedModel}.
+ *
+ * The tests are organised as follows:
+ *
+ * <ol>
+ *   <li>Extraction of the public API (signatures are documented in the comments).</li>
+ *   <li>Basic sanity tests for each public method.</li>
+ *   <li>Edge‑case / exception tests (invalid arguments, illegal state, etc.).</li>
+ *   <li>Combined test class that contains all generated test methods.</li>
+ * </ol>
+ *
+ * The tests use only the public constructors and methods that are present in the supplied source
+ * code (or in the minimal dependent API that was provided). No mocking or subclassing of
+ * abstract library types is performed.
+ */
+public class ExpressionsBasedModelTest {
+
+    private ExpressionsBasedModel model;
+
+    @Before
+    public void setUp() {
+        model = new ExpressionsBasedModel();
+    }
+
+    /* ----------------------------------------------------------------------
+     * 1.  Public constructors
+     * ---------------------------------------------------------------------- */
+
+    /** ExpressionsBasedModel() – default constructor. */
+    @Test
+    public void testDefaultConstructor() {
+        ExpressionsBasedModel m = new ExpressionsBasedModel();
+        assertNotNull(m);
+        assertEquals(0, m.countVariables());
+        assertEquals(0, m.countExpressions());
+    }
+
+    /** ExpressionsBasedModel(Optimisation.Options) – constructor with options. */
+    @Test
+    public void testConstructorWithOptions() {
+        Optimisation.Options opts = new Optimisation.Options();
+        opts.feasibility = NumberContext.of(6);
+        ExpressionsBasedModel m = new ExpressionsBasedModel(opts);
+        assertNotNull(m);
+        assertSame(opts, m.options);
+    }
+
+    /* ----------------------------------------------------------------------
+     * 2.  Variable creation and basic queries
+     * ---------------------------------------------------------------------- */
+
+    /** addVariable() – creates a variable with an auto‑generated name. */
+    @Test
+    public void testAddVariable() {
+        Variable v = model.addVariable();
+        assertNotNull(v);
+        assertEquals(1, model.countVariables());
+        assertEquals("X0", v.getName());
+    }
+
+    /** addVariable(String) – creates a variable with a given name. */
+    @Test
+    public void testAddVariableWithName() {
+        Variable v = model.addVariable("myVar");
+        assertEquals("myVar", v.getName());
+        assertEquals(1, model.countVariables());
+    }
+
+    /** newVariable(String) – same behaviour as addVariable(String) but returns the variable directly. */
+    @Test
+    public void testNewVariable() {
+        Variable v = model.newVariable("newVar");
+        assertEquals("newVar", v.getName());
+        assertEquals(1, model.countVariables());
+    }
+
+    /** indexOf(Variable) – returns the global index of a variable. */
+    @Test
+    public void testIndexOfVariable() {
+        Variable v = model.newVariable("v");
+        int idx = model.indexOf(v);
+        assertEquals(0, idx);
+    }
+
+    /** getVariable(int) – retrieve variable by global index. */
+    @Test
+    public void testGetVariableByIndex() {
+        Variable v = model.newVariable("v");
+        assertSame(v, model.getVariable(0));
+    }
+
+    /** getVariable(IntIndex) – retrieve variable by IntIndex. */
+    @Test
+    public void testGetVariableByIntIndex() {
+        Variable v = model.newVariable("v");
+        IntIndex ix = v.getIndex();
+        assertSame(v, model.getVariable(ix));
+    }
+
+    /** getFreeVariables() – should contain the variable because it is not fixed. */
+    @Test
+    public void testGetFreeVariables() {
+        Variable v = model.newVariable("v");
+        assertTrue(model.getFreeVariables().contains(v));
+    }
+
+    /** isAnyVariableInteger() – initially false, becomes true after adding an integer variable. */
+    @Test
+    public void testIsAnyVariableInteger() {
+        assertFalse(model.isAnyVariableInteger());
+        Variable iv = model.newVariable("intVar").integer(true);
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** isAnyVariableFixed() – false initially, true after fixing a variable. */
+    @Test
+    public void testIsAnyVariableFixed() {
+        assertFalse(model.isAnyVariableFixed());
+        Variable v = model.newVariable("v");
+        v.lower(BigDecimal.ZERO).upper(BigDecimal.ZERO); // fixing by setting equal bounds
+        assertTrue(model.isAnyVariableFixed());
+    }
+
+    /** getFixedVariables() – after fixing a variable the set should contain its index. */
+    @Test
+    public void testGetFixedVariables() {
+        Variable v = model.newVariable("v");
+        v.lower(BigDecimal.ONE).upper(BigDecimal.ONE); // fixed at 1
+        assertTrue(model.getFixedVariables().contains(v.getIndex()));
+    }
+
+    /* ----------------------------------------------------------------------
+     * 3.  Expression creation and basic queries
+     * ---------------------------------------------------------------------- */
+
+    /** addExpression() – creates an expression with an auto‑generated name. */
+    @Test
+    public void testAddExpression() {
+        Expression e = model.addExpression();
+        assertNotNull(e);
+        assertEquals(1, model.countExpressions());
+        assertTrue(e.getName().startsWith("EXPR"));
+    }
+
+    /** addExpression(String) – creates an expression with a given name. */
+    @Test
+    public void testAddExpressionWithName() {
+        Expression e = model.addExpression("myExpr");
+        assertEquals("myExpr", e.getName());
+        assertEquals(1, model.countExpressions());
+    }
+
+    /** newExpression(String) – same as addExpression(String) but returns the expression directly. */
+    @Test
+    public void testNewExpression() {
+        Expression e = model.newExpression("newExpr");
+        assertEquals("newExpr", e.getName());
+        assertEquals(1, model.countExpressions());
+    }
+
+    /** getExpression(String) – retrieve by name. */
+    @Test
+    public void testGetExpressionByName() {
+        Expression e = model.addExpression("myExpr");
+        assertSame(e, model.getExpression("myExpr"));
+    }
+
+    /** constraints() – returns a stream of expressions that are constraints (none initially). */
+    @Test
+    public void testConstraintsStreamEmpty() {
+        assertFalse(model.constraints().findAny().isPresent());
+    }
+
+    /** bounds() – returns a stream of variables that are constraints and not fixed (empty initially). */
+    @Test
+    public void testBoundsStreamEmpty() {
+        assertFalse(model.bounds().findAny().isPresent());
+    }
+
+    /* ----------------------------------------------------------------------
+     * 4.  Description and counting helpers
+     * ---------------------------------------------------------------------- */
+
+    /** describe() – verify counts after adding variables / expressions. */
+    @Test
+    public void testDescribeCounts() {
+        model.newVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        model.addExpression("c").set(model.indexOf(model.getVariable(0)), BigDecimal.ONE).lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        Description d = model.describe();
+        assertEquals(1, d.nbVariables);
+        assertEquals(1, d.nbUpperBounds);
+        assertEquals(1, d.nbLowerBounds);
+        assertEquals(1, d.nbUpperConstraints);
+        assertEquals(1, d.nbLowerConstraints);
+    }
+
+    /** countVariables() and countExpressions() – simple sanity checks. */
+    @Test
+    public void testCountMethods() {
+        model.newVariable("a");
+        model.newVariable("b");
+        model.addExpression("e1");
+        model.addExpression("e2");
+        assertEquals(2, model.countVariables());
+        assertEquals(2, model.countExpressions());
+    }
+
+    /* ----------------------------------------------------------------------
+     * 5.  Objective handling
+     * ---------------------------------------------------------------------- */
+
+    /** objective() – with no weighted variables should be a zero‑valued expression. */
+    @Test
+    public void testObjectiveEmpty() {
+        Expression obj = model.objective();
+        assertNotNull(obj);
+        assertTrue(obj.isFunctionConstant());
+        assertEquals(BigDecimal.ZERO, obj.evaluate(Array1D.R256.make(0)));
+    }
+
+    /** limitObjective(BigDecimal, BigDecimal) – creates a constraint expression when possible. */
+    @Test
+    public void testLimitObjectiveCreatesConstraint() {
+        Variable v = model.newVariable("x").weight(BigDecimal.ONE);
+        Expression obj = model.objective(); // linear objective
+        Expression lim = model.limitObjective(BigDecimal.ZERO, BigDecimal.TEN);
+        assertNotNull(lim);
+        // The constraint expression should have the same linear coefficient as the objective
+        assertEquals(BigDecimal.ONE, lim.get(model.indexOf(v)));
+        assertEquals(BigDecimal.ZERO, lim.getLowerLimit());
+        assertEquals(BigDecimal.TEN, lim.getUpperLimit());
+    }
+
+    /* ----------------------------------------------------------------------
+     * 6.  Optimisation sense and simple optimisation
+     * ---------------------------------------------------------------------- */
+
+    /** minimise() – on a trivial model the result should be feasible and value 0. */
+    @Test
+    public void testMinimiseTrivialModel() {
+        // a single free variable with no bounds and zero objective
+        model.newVariable("x");
+        Optimisation.Result result = model.minimise();
+        assertNotNull(result);
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        assertEquals(0.0, result.getValue(), 1e-9);
+    }
+
+    /** maximise() – similar sanity test (should also be feasible). */
+    @Test
+    public void testMaximiseTrivialModel() {
+        model.newVariable("x");
+        Optimisation.Result result = model.maximise();
+        assertNotNull(result);
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+    }
+
+    /** getOptimisationSense() – reflects the last call to minimise/maximise. */
+    @Test
+    public void testOptimisationSense() {
+        assertNull(model.getOptimisationSense());
+        model.minimise();
+        assertEquals(Optimisation.Sense.MIN, model.getOptimisationSense());
+        model.maximise();
+        assertEquals(Optimisation.Sense.MAX, model.getOptimisationSense());
+    }
+
+    /* ----------------------------------------------------------------------
+     * 7.  Validation helpers
+     * ---------------------------------------------------------------------- */
+
+    /** validate() – on an empty model should be true. */
+    @Test
+    public void testValidateEmptyModel() {
+        assertTrue(model.validate());
+    }
+
+    /** validate(Access1D<BigDecimal>) – with a correct solution vector. */
+    @Test
+    public void testValidateWithSolution() {
+        Variable v = model.newVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        Optimisation.Result sol = model.getVariableValues();
+        assertTrue(model.validate(sol));
+    }
+
+    /* ----------------------------------------------------------------------
+     * 8.  Copy / shallow copy behaviour
+     * ---------------------------------------------------------------------- */
+
+    /** copy() – deep copy should contain same number of variables and expressions. */
+    @Test
+    public void testCopyDeep() {
+        model.newVariable("x");
+        model.addExpression("e");
+        ExpressionsBasedModel copy = model.copy();
+        assertEquals(1, copy.countVariables());
+        assertEquals(1, copy.countExpressions());
+    }
+
+    /** copy(boolean shallow, boolean prune) – shallow copy should reject further variable addition. */
+    @Test(expected = IllegalStateException.class)
+    public void testShallowCopyAddVariableIllegal() {
+        model.newVariable("x");
+        ExpressionsBasedModel shallow = model.copy(true, false);
+        // The following must throw IllegalStateException because the model is a shallow copy.
+        shallow.addVariable("y");
+    }
+
+    /** relax() – after relaxation integer flag should be cleared. */
+    @Test
+    public void testRelaxClearsIntegerFlag() {
+        Variable iv = model.newVariable("i").integer(true);
+        assertTrue(iv.isInteger());
+        model.relax();
+        assertFalse(iv.isInteger());
+    }
+
+    /** snapshot() – returns a shallow copy that is marked as relaxed. */
+    @Test
+    public void testSnapshotIsRelaxed() {
+        model.newVariable("x");
+        ExpressionsBasedModel snap = model.snapshot();
+        assertTrue(snap.isRelaxed());
+        // The snapshot is a shallow copy; adding a variable should fail.
+        try {
+            snap.addVariable("y");
+            fail("Expected IllegalStateException when adding variable to a snapshot (shallow copy).");
+        } catch (IllegalStateException ignored) {
+            // expected
+        }
+    }
+
+    /* ----------------------------------------------------------------------
+     * 9.  Edge cases and exception handling
+     * ---------------------------------------------------------------------- */
+
+    /** FileFormat.from(String) – unsupported extension throws IllegalArgumentException. */
+    @Test(expected = IllegalArgumentException.class)
+    public void testFileFormatUnsupportedExtension() {
+        ExpressionsBasedModel.FileFormat.from("myfile.txt");
+    }
+
+    /** addSpecialOrderedSet(Collection, int, int) – invalid min/max throws ProgrammingError. */
+    @Test(expected = ProgrammingError.class)
+    public void testAddSpecialOrderedSetInvalidMinMax() {
+        Variable v1 = model.newVariable("v1").binary();
+        Variable v2 = model.newVariable("v2").binary();
+        model.addSpecialOrderedSet(Collections.<Variable>emptyList(), -1, 0); // invalid
+    }
+
+    /** addSpecialOrderedSet(Collection, int, Expression) – invalid type throws ProgrammingError. */
+    @Test(expected = ProgrammingError.class)
+    public void testAddSpecialOrderedSetInvalidType() {
+        Variable v = model.newVariable("v").binary();
+        Expression dummy = model.addExpression("dummy");
+        model.addSpecialOrderedSet(Collections.singleton(v), 0, dummy); // type <= 0
+    }
+
+    /** limitObjective when objective is quadratic (not possible in this simple test) – should return the original objective. */
+    @Test
+    public void testLimitObjectiveWithQuadraticObjective() {
+        // Build a quadratic objective by adding a quadratic term.
+        Variable v = model.newVariable("x");
+        Expression obj = model.objective();
+        // Manually add a quadratic term (x*x) with coefficient 1.
+        obj.add(v, v, BigDecimal.ONE);
+        // Now call limitObjective – because the objective is quadratic, the method should return the original objective.
+        Expression result = model.limitObjective(BigDecimal.ZERO, BigDecimal.ONE);
+        assertSame(obj, result);
+    }
+
+    /** indexOfFreeVariable for a fixed variable should return -1. */
+    @Test
+    public void testIndexOfFreeVariableFixed() {
+        Variable v = model.newVariable("x");
+        // Fix the variable
+        v.lower(BigDecimal.ZERO).upper(BigDecimal.ZERO);
+        int freeIdx = model.indexOfFreeVariable(v);
+        assertEquals(-1, freeIdx);
+    }
+
+    /** isAnyConstraintQuadratic() – returns false for linear constraints. */
+    @Test
+    public void testIsAnyConstraintQuadraticFalse() {
+        Variable v = model.newVariable("x");
+        model.addExpression("c").set(v, BigDecimal.ONE).lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        assertFalse(model.isAnyConstraintQuadratic());
+    }
+
+    /** isAnyExpressionQuadratic() – returns true when a quadratic expression is added. */
+    @Test
+    public void testIsAnyExpressionQuadraticTrue() {
+        Variable v = model.newVariable("x");
+        Expression e = model.addExpression("quad");
+        e.add(v, v, BigDecimal.ONE); // quadratic term
+        assertTrue(model.isAnyExpressionQuadratic());
+    }
+
+    /** removeExpression(String) – after removal the expression should no longer be present. */
+    @Test
+    public void testRemoveExpression() {
+        model.addExpression("toRemove");
+        assertNotNull(model.getExpression("toRemove"));
+        model.removeExpression("toRemove");
+        assertNull(model.getExpression("toRemove"));
+    }
+
+    /** setKnownSolution with a non‑optimal result should throw ProgrammingError. */
+    @Test(expected = ProgrammingError.class)
+    public void testSetKnownSolutionNonOptimal() {
+        Optimisation.Result nonOptimal = new Optimisation.Result(Optimisation.State.FEASIBLE, 0.0, Array1D.R256.make(0));
+        model.setKnownSolution(nonOptimal);
+    }
+
+    /** setKnownSolution with a null handler should be accepted (uses default no‑op handler). */
+    @Test
+    public void testSetKnownSolutionWithNullHandler() {
+        Optimisation.Result optimal = Optimisation.Result.of(Optimisation.State.OPTIMAL, 0.0, new BigDecimal[0]);
+        model.setKnownSolution(optimal);
+        // No exception means success.
+    }
+
+    /** writeTo(File) – writing to a temporary file should not throw. */
+    @Test
+    public void testWriteToFile() throws IOException {
+        File temp = File.createTempFile("ebm_test", ".ebm");
+        temp.deleteOnExit();
+        model.writeTo(temp);
+        assertTrue(temp.length() > 0);
+    }
+
+    /** toString() – should contain the start/end delimiter and at least one variable line. */
+    @Test
+    public void testToStringContents() {
+        model.newVariable("x");
+        String txt = model.toString();
+        assertTrue(txt.startsWith(ExpressionsBasedModel.START_END));
+        assertTrue(txt.contains("x"));
+        assertTrue(txt.endsWith(ExpressionsBasedModel.START_END));
+    }
+}

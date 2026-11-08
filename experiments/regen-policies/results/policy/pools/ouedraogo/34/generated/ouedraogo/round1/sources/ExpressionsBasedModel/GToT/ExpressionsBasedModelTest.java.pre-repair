@@ -1,0 +1,396 @@
+package org.ojalgo.optimisation;
+
+import static org.junit.Assert.*;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.*;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.type.context.NumberContext;
+
+/**
+ * JUnit‑4 test suite for {@link ExpressionsBasedModel}.  The tests are organised
+ * in three logical groups that correspond to the three “experts” described in the
+ * task:
+ *
+ * <ol>
+ *   <li>Extraction of public API and basic functional tests.</li>
+ *   <li>Edge‑case and exception handling tests.</li>
+ *   <li>Combination of the above into a single comprehensive test class.</li>
+ * </ol>
+ *
+ * All tests use only the public constructors, methods and static factories that
+ * are present in the supplied source code (or its listed dependencies).  No
+ * mocking or subclassing of library types is performed.
+ */
+public class ExpressionsBasedModelTest {
+
+    private ExpressionsBasedModel model;
+
+    @Before
+    public void setUp() {
+        // a fresh model for each test
+        model = new ExpressionsBasedModel();
+    }
+
+    @After
+    public void tearDown() {
+        model.dispose();
+        model = null;
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* 1.  Basic functionality – one test per public method                */
+    /* --------------------------------------------------------------------- */
+
+    @Test
+    public void testAddVariableAndIndexing() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        assertEquals(0, model.indexOf(x));
+        assertEquals(1, model.indexOf(y));
+
+        assertEquals(0, model.indexOfFreeVariable(x));
+        assertEquals(1, model.indexOfFreeVariable(y));
+
+        // integer indexing variants
+        assertEquals(0, model.indexOfFreeVariable(x.getIndex()));
+        assertEquals(0, model.indexOfFreeVariable(x.getIndex().index));
+    }
+
+    @Test
+    public void testAddExpressionAndRetrieval() {
+        Expression e1 = model.addExpression("e1");
+        Expression e2 = model.addExpression(); // auto‑generated name
+
+        assertSame(e1, model.getExpression("e1"));
+        assertNotNull(e2);
+        assertTrue(model.getExpressions().contains(e1));
+        assertTrue(model.getExpressions().contains(e2));
+    }
+
+    @Test
+    public void testExpressionOverwrite() {
+        model.addExpression("dup");
+        Expression second = model.addExpression("dup"); // should replace the first
+        assertEquals(1, model.countExpressions());
+        assertSame(second, model.getExpression("dup"));
+    }
+
+    @Test
+    public void testVariableStreams() {
+        Variable a = model.addVariable("a").lower(0).upper(10);
+        Variable b = model.addVariable("b").integer(true);
+        Variable c = model.addVariable("c").binary();
+
+        // bounds() – only non‑fixed variables that are constraints
+        List<Variable> bounds = model.bounds().collect(Collectors.toList());
+        assertTrue(bounds.containsAll(Arrays.asList(a, b, c)));
+
+        // variables() – all non‑fixed variables
+        List<Variable> vars = model.variables().collect(Collectors.toList());
+        assertEquals(3, vars.size());
+        assertTrue(vars.containsAll(Arrays.asList(a, b, c)));
+    }
+
+    @Test
+    public void testObjectiveConstruction() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        Variable y = model.addVariable("y").weight(BigDecimal.valueOf(2));
+
+        Expression obj = model.objective();
+        assertEquals(BigDecimal.ONE, obj.get(x.getIndex()));
+        assertEquals(BigDecimal.valueOf(2), obj.get(y.getIndex()));
+        assertEquals(BigDecimal.ZERO, obj.getConstant());
+
+        // add an expression that also contributes to the objective
+        Expression e = model.addExpression("e");
+        e.set(x.getIndex(), BigDecimal.valueOf(3));
+        e.weight(BigDecimal.valueOf(5)); // contribution weight = 5
+        Expression combined = model.objective();
+
+        // contribution: 5 * (3 * x) = 15 * x
+        BigDecimal expectedX = BigDecimal.ONE.add(BigDecimal.valueOf(15));
+        assertEquals(expectedX, combined.get(x.getIndex()));
+        // y is unchanged
+        assertEquals(BigDecimal.valueOf(2), combined.get(y.getIndex()));
+    }
+
+    @Test
+    public void testLimitObjectiveCreatesConstraint() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        model.objective(); // ensure an objective exists
+        Expression limit = model.limitObjective(BigDecimal.ZERO, BigDecimal.TEN);
+        assertNotNull(limit);
+        assertTrue(limit.isConstraint());
+        assertEquals(BigDecimal.ZERO, limit.getLowerLimit());
+        assertEquals(BigDecimal.TEN, limit.getUpperLimit());
+    }
+
+    @Test
+    public void testOptimisationSenseAndResult() {
+        model.addVariable("x").weight(BigDecimal.ONE);
+        Optimisation.Result minResult = model.minimise();
+        assertEquals(Optimisation.Sense.MIN, model.getOptimisationSense());
+        assertNotNull(minResult);
+
+        Optimisation.Result maxResult = model.maximise();
+        assertEquals(Optimisation.Sense.MAX, model.getOptimisationSense());
+        assertNotNull(maxResult);
+    }
+
+    @Test
+    public void testCopyAndShallowCopyBehaviour() {
+        model.addVariable("x").lower(0).upper(5);
+        model.addExpression("e").set(model.getVariable(0).getIndex(), BigDecimal.ONE);
+
+        ExpressionsBasedModel deepCopy = model.copy();
+        assertEquals(model.countVariables(), deepCopy.countVariables());
+        assertEquals(model.countExpressions(), deepCopy.countExpressions());
+
+        // shallow copy – changes to the original must NOT affect the copy's variable list
+        ExpressionsBasedModel shallow = model.copy(true, false);
+        assertEquals(model.countVariables(), shallow.countVariables());
+
+        // after adding a new variable to the original, shallow copy should stay unchanged
+        model.addVariable("y");
+        assertEquals(2, model.countVariables());
+        assertEquals(1, shallow.countVariables()); // unchanged
+    }
+
+    @Test
+    public void testDescribeCounts() {
+        model.addVariable("x").lower(0).upper(10);
+        model.addVariable("y").integer(true);
+        model.addExpression("c1").lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        model.addExpression("c2").upper(BigDecimal.valueOf(5));
+
+        ExpressionsBasedModel.Description d = model.describe();
+        assertEquals(2, d.nbVariables);
+        assertEquals(1, d.nbIntegerVariables);
+        assertEquals(1, d.nbLowerBounds);
+        assertEquals(2, d.nbUpperBounds);
+        assertEquals(1, d.nbLowerConstraints);
+        assertEquals(2, d.nbUpperConstraints);
+    }
+
+    @Test
+    public void testGetVariableValuesAndState() {
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        // No value set – the method will use the lower limit as a fallback for equality constraints.
+        Optimisation.Result result = model.getVariableValues();
+
+        // All variables have a defined value (lower bound) -> state should be FEASIBLE
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+
+        // The solution should contain the lower bound (0) for x
+        assertEquals(0.0, result.doubleValue(0), 1e-9);
+    }
+
+    @Test
+    public void testValidationSuccessAndFailure() {
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+        // valid solution
+        assertTrue(model.validate(Access1D.wrap(new BigDecimal[]{BigDecimal.ZERO})));
+
+        // invalid solution – out of bounds
+        assertFalse(model.validate(Access1D.wrap(new BigDecimal[]{BigDecimal.valueOf(2)})));
+    }
+
+    @Test
+    public void testRelaxAndIntegerFlags() {
+        Variable i = model.addVariable("i").integer(true);
+        assertTrue(model.isAnyVariableInteger());
+
+        model.relax(); // hard relax – removes integer flag
+        assertFalse(model.isAnyVariableInteger());
+
+        // soft relax – keeps integer flag but model is marked relaxed
+        Variable j = model.addVariable("j").integer(true);
+        model.relax(true);
+        assertTrue(model.isAnyVariableInteger());
+        assertTrue(model.isRelaxed());
+    }
+
+    @Test
+    public void testSetKnownSolutionValidates() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        Optimisation.Result optimal = Optimisation.Result.of(Optimisation.State.OPTIMAL, 5.0,
+                Access1D.wrap(new BigDecimal[]{BigDecimal.ONE}));
+        // The solution is feasible for the trivial model
+        model.setKnownSolution(optimal);
+        assertSame(optimal, model.getKnownSolution());
+    }
+
+    @Test(expected = ProgrammingError.class)
+    public void testSetKnownSolutionInvalidThrows() {
+        Variable x = model.addVariable("x");
+        // not optimal – should trigger ProgrammingError
+        Optimisation.Result notOptimal = Optimisation.Result.of(Optimisation.State.INFEASIBLE, 0.0,
+                Access1D.wrap(new BigDecimal[]{BigDecimal.ZERO}));
+        model.setKnownSolution(notOptimal);
+    }
+
+    @Test
+    public void testWriteToAndParseRoundTrip() throws Exception {
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        model.addExpression("c").set(x.getIndex(), BigDecimal.ONE).upper(BigDecimal.valueOf(5));
+
+        File tmp = File.createTempFile("ebm", ".ebm");
+        tmp.deleteOnExit();
+
+        model.writeTo(tmp);
+        ExpressionsBasedModel readBack = ExpressionsBasedModel.parse(tmp);
+        assertEquals(1, readBack.countVariables());
+        assertEquals(1, readBack.countExpressions());
+        assertEquals(BigDecimal.ZERO, readBack.getVariable(0).getLowerLimit());
+        assertEquals(BigDecimal.TEN, readBack.getVariable(0).getUpperLimit());
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* 2.  Edge‑case and exception handling tests                           */
+    /* --------------------------------------------------------------------- */
+
+    @Test(expected = IllegalStateException.class)
+    public void testAddVariableAfterShallowCopy() {
+        ExpressionsBasedModel shallow = model.copy(true, false);
+        shallow.addVariable("shouldFail");
+    }
+
+    @Test(expected = ProgrammingError.class)
+    public void testAddSpecialOrderedSetInvalidType() {
+        Variable v1 = model.addVariable("v1").binary();
+        Variable v2 = model.addVariable("v2").binary();
+        List<Variable> set = Arrays.asList(v1, v2);
+        model.addSpecialOrderedSet(set, 0, null); // type <= 0 should raise ProgrammingError
+    }
+
+    @Test(expected = ProgrammingError.class)
+    public void testAddSpecialOrderedSetWithNonBinaryVariable() {
+        Variable v1 = model.addVariable("v1"); // not binary
+        List<Variable> set = Collections.singletonList(v1);
+        model.addSpecialOrderedSet(set, 1, 2);
+    }
+
+    @Test
+    public void testGetExpressionUnknownReturnsNull() {
+        assertNull(model.getExpression("nonexistent"));
+    }
+
+    @Test
+    public void testRemoveExpression() {
+        model.addExpression("toRemove");
+        assertNotNull(model.getExpression("toRemove"));
+        model.removeExpression("toRemove");
+        assertNull(model.getExpression("toRemove"));
+    }
+
+    @Test
+    public void testIsAnyConstraintQuadraticFalseForLinearModel() {
+        Variable x = model.addVariable("x");
+        model.addExpression("c").set(x.getIndex(), BigDecimal.ONE).upper(BigDecimal.TEN);
+        assertFalse(model.isAnyConstraintQuadratic());
+    }
+
+    @Test
+    public void testIsAnyExpressionQuadraticFalseForLinearModel() {
+        Variable x = model.addVariable("x");
+        model.addExpression("c").set(x.getIndex(), BigDecimal.ONE).upper(BigDecimal.TEN);
+        assertFalse(model.isAnyExpressionQuadratic());
+    }
+
+    @Test
+    public void testIsAnyObjectiveQuadraticFalse() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        assertFalse(model.isAnyObjectiveQuadratic());
+    }
+
+    @Test
+    public void testIsAnyVariableFixedTrue() {
+        Variable x = model.addVariable("x").value(BigDecimal.ONE);
+        assertTrue(model.isAnyVariableFixed());
+    }
+
+    @Test
+    public void testIsUnboundedTrueWhenNoLimits() {
+        model.addVariable("free");
+        assertTrue(model.isUnbounded());
+    }
+
+    @Test
+    public void testSimplifyDoesNotThrowOnTrivialModel() {
+        // trivial model – one variable, no constraints
+        model.addVariable("x");
+        ExpressionsBasedModel simplified = model.simplify();
+        assertNotNull(simplified);
+        assertEquals(1, simplified.countVariables());
+    }
+
+    @Test
+    public void testReduceDoesNotChangeSimpleModel() {
+        model.addVariable("x");
+        model.addExpression("c").set(model.getVariable(0).getIndex(), BigDecimal.ONE).upper(BigDecimal.TEN);
+        model.reduce(); // should complete without exception
+        assertEquals(1, model.countExpressions());
+    }
+
+    @Test
+    public void testPrepareFactoryUsage() {
+        // Use prepare with a simple lambda that returns a dummy IntermediateSolver subclass
+        ExpressionsBasedModel.Integration<?> dummyIntegration = new ExpressionsBasedModel.Integration<Object>() {
+            @Override public boolean isCapable(ExpressionsBasedModel m) { return true; }
+        };
+        // Force the model to use this dummy integration via reflection (not needed for the test)
+        // The purpose is only to verify that prepare correctly forwards the factory.
+        ExpressionsBasedModel.IntermediateSolver solver = model.prepare(m -> new ExpressionsBasedModel.DefaultIntermediate(m));
+        assertNotNull(solver);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* 3.  Comprehensive test covering typical usage scenarios              */
+    /* --------------------------------------------------------------------- */
+
+    @Test
+    public void testTypicalLinearProgram() {
+        // Build a small LP: minimise 3x + 4y  subject to
+        //   x + 2y >= 8
+        //   3x + y <= 12
+        //   0 <= x <= 5, 0 <= y <= 5
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.valueOf(5)).weight(BigDecimal.valueOf(3));
+        Variable y = model.addVariable("y").lower(BigDecimal.ZERO).upper(BigDecimal.valueOf(5)).weight(BigDecimal.valueOf(4));
+
+        // constraint 1: x + 2y >= 8  →  lower bound = 8
+        model.addExpression("c1")
+                .set(x.getIndex(), BigDecimal.ONE)
+                .set(y.getIndex(), BigDecimal.valueOf(2))
+                .lower(BigDecimal.valueOf(8));
+
+        // constraint 2: 3x + y <= 12 → upper bound = 12
+        model.addExpression("c2")
+                .set(x.getIndex(), BigDecimal.valueOf(3))
+                .set(y.getIndex(), BigDecimal.ONE)
+                .upper(BigDecimal.valueOf(12));
+
+        // Solve
+        Optimisation.Result result = model.minimise();
+
+        // Verify that a feasible solution is returned and that the objective value matches
+        assertEquals(Optimisation.State.OPTIMAL, result.getState());
+
+        double xVal = result.doubleValue(0);
+        double yVal = result.doubleValue(1);
+        double objective = 3 * xVal + 4 * yVal;
+
+        assertEquals(objective, result.getValue(), 1e-6);
+        // The optimal solution for this tiny LP is (x=2, y=3)
+        assertEquals(2.0, xVal, 1e-6);
+        assertEquals(3.0, yVal, 1e-6);
+    }
+}

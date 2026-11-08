@@ -1,0 +1,386 @@
+package org.ojalgo.optimisation;
+import org.ojalgo.structure.Access1D;
+
+
+import static org.junit.Assert.*;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+import org.junit.Test;
+import org.ojalgo.optimisation.ExpressionsBasedModel.Description;
+import org.ojalgo.optimisation.ExpressionsBasedModel.FileFormat;
+import org.ojalgo.optimisation.ExpressionsBasedModel.Integration;
+import org.ojalgo.type.context.NumberContext;
+import org.ojalgo.netio.BasicLogger;
+
+/**
+ * Unit tests for {@link ExpressionsBasedModel}. The tests exercise the public API
+ * without invoking any external solvers – only the in‑memory model manipulation
+ * logic is verified.
+ */
+public class ExpressionsBasedModelTest {
+
+    /**
+     * Verify that variables and expressions can be added and that the internal
+     * counters reflect the additions.
+     */
+    @Test
+    public void testAddVariableAndExpressionCounts() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // add three variables
+        model.addVariable("x1");
+        model.addVariable("x2");
+        model.addVariable("x3");
+
+        // add two simple expressions
+        model.addExpression("e1");
+        model.addExpression("e2");
+
+        assertEquals(3, model.countVariables());
+        assertEquals(2, model.countExpressions());
+
+        // the collections returned should be unmodifiable
+        try {
+            model.getVariables().add(model.newVariable("illegal"));
+            fail("Variables list should be unmodifiable");
+        } catch (UnsupportedOperationException ok) {
+        }
+
+        try {
+            model.getExpressions().add(model.newExpression("illegal"));
+            fail("Expressions collection should be unmodifiable");
+        } catch (UnsupportedOperationException ok) {
+        }
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#describe()} returns correct counts
+     * for variables with bounds, integer flag and for constraints.
+     */
+    @Test
+    public void testDescriptionCounts() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // variable 0 : lower bound only
+        Variable v0 = model.addVariable("v0");
+        v0.lower(0);
+
+        // variable 1 : upper bound only
+        Variable v1 = model.addVariable("v1");
+        v1.upper(10);
+
+        // variable 2 : both bounds (equality) and integer
+        Variable v2 = model.addVariable("v2");
+        v2.lower(5).upper(5).integer(true);
+
+        // expression that is a constraint (upper bound)
+        Expression e = model.addExpression("c1");
+        e.add(v0, 1).add(v1, 1).upper(BigDecimal.valueOf(12));
+
+        Description desc = model.describe();
+
+        // variable counts
+        assertEquals(3, desc.nbVariables);
+        assertEquals(1, desc.nbIntegerVariables); // only v2 is integer
+        assertEquals(2, desc.nbPositiveVariables); // v0 (lower 0) and v1 (upper 10) allow positive values
+        assertEquals(0, desc.nbNegativeVariables); // none allow negative values
+
+        // bound counts
+        assertEquals(1, desc.nbLowerBounds); // v0 has lower bound
+        assertEquals(1, desc.nbUpperBounds); // v1 has upper bound
+        assertEquals(1, desc.nbEqualityBounds); // v2 equality bound
+
+        // constraint counts (one expression)
+        assertEquals(0, desc.nbEqualityConstraints);
+        assertEquals(0, desc.nbLowerConstraints);
+        assertEquals(1, desc.nbUpperConstraints);
+    }
+
+    /**
+     * Verify the various index lookup helpers.
+     */
+    @Test
+    public void testIndexLookup() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+        Variable c = model.addVariable("c");
+
+        // global indices
+        int idxA = model.indexOf(a);
+        int idxB = model.indexOf(b);
+        int idxC = model.indexOf(c);
+        assertEquals(0, idxA);
+        assertEquals(1, idxB);
+        assertEquals(2, idxC);
+
+        // free variable indices (all are free)
+        assertEquals(0, model.indexOfFreeVariable(idxA));
+        assertEquals(1, model.indexOfFreeVariable(idxB));
+        assertEquals(2, model.indexOfFreeVariable(idxC));
+
+        // integer variable indices (none are integer yet)
+        assertEquals(-1, model.indexOfIntegerVariable(idxA));
+        assertEquals(-1, model.indexOfIntegerVariable(idxB));
+        assertEquals(-1, model.indexOfIntegerVariable(idxC));
+
+        // make variable b integer and test again
+        b.integer(true);
+        assertEquals(0, model.indexOfIntegerVariable(idxB));
+        assertEquals(-1, model.indexOfIntegerVariable(idxA));
+        assertEquals(-1, model.indexOfIntegerVariable(idxC));
+
+        // negative / positive indices (none negative, all positive because no lower limits set)
+        assertEquals(-1, model.indexOfNegativeVariable(idxA));
+        assertEquals(-1, model.indexOfNegativeVariable(idxB));
+        assertEquals(-1, model.indexOfNegativeVariable(idxC));
+
+        assertEquals(0, model.indexOfPositiveVariable(idxA));
+        assertEquals(1, model.indexOfPositiveVariable(idxB));
+        assertEquals(2, model.indexOfPositiveVariable(idxC));
+    }
+
+    /**
+     * Test {@link ExpressionsBasedModel#getVariableValues()} when the model has
+     * insufficient information – the result should be marked INFEASIBLE.
+     */
+    @Test
+    public void testVariableValuesInfeasible() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // add a variable without any bounds or explicit value
+        model.addVariable("x");
+
+        Optimisation.Result result = model.getVariableValues();
+
+        assertEquals(Optimisation.State.INFEASIBLE, result.getState());
+    }
+
+    /**
+     * Test {@link ExpressionsBasedModel#getVariableValues()} when values are
+     * explicitly set – the result should be FEASIBLE and the objective value
+     * should be zero (no contributions).
+     */
+    @Test
+    public void testVariableValuesFeasible() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable x = model.addVariable("x");
+        x.value(BigDecimal.valueOf(5));
+
+        Optimisation.Result result = model.getVariableValues();
+
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        // objective is zero because no variable contributes to it
+        assertEquals(0.0, result.getValue(), 1e-12);
+    }
+
+    /**
+     * Validate a manually supplied solution against the model.
+     */
+    @Test
+    public void testValidateSolution() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable x = model.addVariable("x");
+        x.lower(0).upper(10);
+
+        // a simple feasible solution
+        Access1D<BigDecimal> solution = Access1D.wrap(new BigDecimal[] { BigDecimal.valueOf(7) });
+
+        assertTrue(model.validate(solution));
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#isAnyVariableInteger()} reflects the
+     * integer flag of the variables.
+     */
+    @Test
+    public void testIsAnyVariableInteger() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable v1 = model.addVariable("v1");
+        Variable v2 = model.addVariable("v2");
+
+        assertFalse(model.isAnyVariableInteger());
+
+        v2.integer(true);
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#isAnyExpressionQuadratic()} returns
+     * {@code false} for a model that contains only linear expressions.
+     */
+    @Test
+    public void testIsAnyExpressionQuadratic() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        Expression expr = model.addExpression("lin");
+        expr.add(x, 1).add(y, 2); // linear only
+
+        assertFalse(model.isAnyExpressionQuadratic());
+    }
+
+    /**
+     * Test the {@link ExpressionsBasedModel.FileFormat} utility.
+     */
+    @Test
+    public void testFileFormatFrom() {
+        assertEquals(FileFormat.MPS, FileFormat.from("example.mps"));
+        assertEquals(FileFormat.MPS, FileFormat.from("example.SIF"));
+        assertEquals(FileFormat.EBM, FileFormat.from("model.ebm"));
+
+        // unknown extension should throw IllegalArgumentException
+        try {
+            FileFormat.from("unknown.txt");
+            fail("Expected IllegalArgumentException for unknown file extension");
+        } catch (IllegalArgumentException ok) {
+        }
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#isInfeasible()} correctly
+     * reports infeasibility after adding an obviously infeasible constraint.
+     */
+    @Test
+    public void testIsInfeasibleDetection() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable x = model.addVariable("x");
+        x.lower(0).upper(5);
+
+        // expression requiring x >= 10 (lower bound 10) makes the model infeasible
+        Expression infeas = model.addExpression("infeas");
+        infeas.add(x, 1).lower(BigDecimal.valueOf(10));
+
+        // presolve is automatically invoked during optimisation; however we can
+        // directly ask the model whether it recognises the infeasibility.
+        assertTrue(model.isInfeasible());
+    }
+
+    /**
+     * Ensure that {@link ExpressionsBasedModel#toString()} produces a non‑null
+     * string containing the variable and expression names.
+     */
+    @Test
+    public void testToStringContainsModelElements() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        model.addVariable("a");
+        model.addExpression("expr1");
+
+        String txt = model.toString();
+
+        assertNotNull(txt);
+        assertTrue(txt.contains("a"));
+        assertTrue(txt.contains("expr1"));
+    }
+
+    /**
+     * Verify that calling {@link ExpressionsBasedModel#relax()} clears the integer
+     * flag of all variables.
+     */
+    @Test
+    public void testRelaxClearsIntegerFlag() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable iVar = model.addVariable("intVar").integer(true);
+        Variable fVar = model.addVariable("freeVar");
+
+        assertTrue(iVar.isInteger());
+        assertFalse(fVar.isInteger());
+
+        model.relax();
+
+        assertFalse(iVar.isInteger());
+        assertFalse(fVar.isInteger());
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#copy()} creates an independent
+     * model instance.
+     */
+    @Test
+    public void testCopyCreatesIndependentModel() {
+        ExpressionsBasedModel original = new ExpressionsBasedModel();
+        original.addVariable("x").lower(0).upper(10);
+        original.addExpression("e").add(original.getVariable(0), 1).upper(BigDecimal.valueOf(5));
+
+        ExpressionsBasedModel copy = original.copy();
+
+        // modify copy – the original must stay unchanged
+        copy.getVariable(0).lower(2);
+        copy.getExpression("e").upper(BigDecimal.valueOf(3));
+
+        // original lower bound should still be 0
+        assertEquals(BigDecimal.ZERO, original.getVariable(0).getLowerLimit());
+        // original upper bound of expression should still be 5
+        assertEquals(BigDecimal.valueOf(5), original.getExpression("e").getUpperLimit());
+    }
+
+    /**
+     * Test that {@link ExpressionsBasedModel#isAnyVariableFixed()} reports correctly
+     * when a variable has both lower and upper limits equal.
+     */
+    @Test
+    public void testIsAnyVariableFixed() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable v = model.addVariable("v");
+        // Not fixed yet
+        assertFalse(model.isAnyVariableFixed());
+
+        // Fix the variable by setting identical bounds
+        v.lower(3).upper(3);
+        assertTrue(model.isAnyVariableFixed());
+    }
+
+    /**
+     * Verify that {@link ExpressionsBasedModel#isAnyVariableInteger()} returns
+     * {@code false} when the model is in relaxed mode.
+     */
+    @Test
+    public void testIsAnyVariableIntegerWhenRelaxed() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable v = model.addVariable("v").integer(true);
+        assertTrue(model.isAnyVariableInteger());
+
+        model.relax(); // non‑soft relax clears integer flag
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /**
+     * Verify that the internal {@link ExpressionsBasedModel#isIntegrationSwitch()}
+     * flag can be toggled via the protected API used by integrations.
+     */
+    @Test
+    public void testIntegrationSwitchToggle() {
+        // Use a simple integration stub that flips the switch
+        class DummyIntegration extends ExpressionsBasedModel.Integration<Optimisation.Solver> {
+            DummyIntegration() { super(); }
+            @Override public boolean isCapable(ExpressionsBasedModel model) { return true; }
+            @Override public Optimisation.Result solve(ExpressionsBasedModel model) { return null; }
+        }
+
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+        DummyIntegration integration = new DummyIntegration();
+
+        // initially false
+        assertFalse(model.isIntegrationSwitch());
+
+        // flip via protected method
+        integration.setSwitch(model, true);
+        assertTrue(model.isIntegrationSwitch());
+
+        integration.setSwitch(model, false);
+        assertFalse(model.isIntegrationSwitch());
+    }
+}

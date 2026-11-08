@@ -1,0 +1,5 @@
+policy,dev-scope_regenerations,dev-scope_entered_after_t,dev-scope_alive,dev-scope_segment_denominator,dev-scope_changed_lines_covered,dev-scope_changed_lines_executable,ktester_regenerations,ktester_entered_after_t,ktester_alive,ktester_segment_denominator,ktester_changed_lines_covered,ktester_changed_lines_executable,ouedraogo_regenerations,ouedraogo_entered_after_t,ouedraogo_alive,ouedraogo_segment_denominator,ouedraogo_changed_lines_covered,ouedraogo_changed_lines_executable
+none,0,0,3,353,191,377,0,0,181,197,88,377,0,0,0,15,0,377
+release-reset,2,862,153,494,237,377,2,476,143,149,109,377,2,12,0,12,1,377
+half-reset,1,351,34,351,215,377,0,0,181,197,88,377,1,6,0,6,11,377
+half-fill,0,0,3,353,191,377,0,0,181,197,88,377,1,6,0,6,11,377

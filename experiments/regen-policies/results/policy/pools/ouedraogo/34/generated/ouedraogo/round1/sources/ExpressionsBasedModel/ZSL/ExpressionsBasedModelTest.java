@@ -1,0 +1,347 @@
+package org.ojalgo.optimisation;
+import org.ojalgo.structure.Access1D;
+
+
+import static org.junit.Assert.*;
+import static org.ojalgo.function.constant.BigMath.*;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.optimisation.ExpressionsBasedModel.Description;
+import org.ojalgo.optimisation.ExpressionsBasedModel.Integration;
+import org.ojalgo.optimisation.ExpressionsBasedModel.Presolver;
+import org.ojalgo.structure.Structure1D.IntIndex;
+
+/**
+ * JUnit‑4 test suite for {@link ExpressionsBasedModel}.
+ *
+ * The tests focus on the public API of the model itself – they do **not** attempt to exercise the
+ * underlying solvers (LinearSolver, IntegerSolver, …).  All tests therefore build tiny models,
+ * manipulate them and verify the internal bookkeeping performed by the model (indexes, description,
+ * copying, presolve handling, etc.).
+ *
+ * The static collections that hold integrations and presolvers are cleared before each test to avoid
+ * side effects between test methods.
+ */
+public class ExpressionsBasedModelTest {
+
+    @Before
+    public void resetStatics() {
+        // Ensure a clean static state for every test
+        ExpressionsBasedModel.clearIntegrations();
+        ExpressionsBasedModel.clearPresolvers();
+        ExpressionsBasedModel.resetPresolvers();
+    }
+
+    @Test
+    public void testVariableCreationAndBasicProperties() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // create two variables
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // basic sanity checks
+        assertEquals(2, model.countVariables());
+        assertSame(x, model.getVariable(0));
+        assertSame(y, model.getVariable(1));
+
+        // set bounds and weight (the weight method is defined on ModelEntity)
+        x.lower(BigDecimal.ZERO).upper(BigDecimal.TEN).weight(BigDecimal.ONE);
+        y.lower(BigDecimal.ONE).upper(BigDecimal.valueOf(5)).weight(BigDecimal.valueOf(2));
+
+        // check that the model recognises the variables as non‑fixed
+        assertFalse(model.isAnyVariableFixed());
+
+        // fix variable x by setting identical lower/upper bounds
+        x.lower(BigDecimal.FIVE).upper(BigDecimal.FIVE);
+        assertTrue(x.isFixed());
+        assertTrue(model.isAnyVariableFixed());
+
+        // after fixing, free‑variable index should be -1
+        assertEquals(-1, model.indexOfFreeVariable(x));
+        // y is still free
+        assertTrue(model.indexOfFreeVariable(y) >= 0);
+    }
+
+    @Test
+    public void testExpressionCreationAndObjectiveAggregation() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+
+        // give each variable a contribution weight
+        a.weight(ONE);
+        b.weight(TEN);
+
+        // the aggregated objective should contain the same coefficients
+        Expression obj = model.objective();
+
+        assertEquals(ONE, obj.get(a.getIndex()));
+        assertEquals(TEN, obj.get(b.getIndex()));
+
+        // add a separate expression that also contributes to the objective
+        Expression expr = model.addExpression("extra");
+        expr.set(a.getIndex(), TWO); // coefficient 2 for a
+        expr.weight(THREE);          // contribution weight 3
+
+        // after re‑building the objective the coefficient for a must be: 1 (variable) + 2*3 = 7
+        Expression newObj = model.objective();
+        assertEquals(new BigDecimal("7"), newObj.get(a.getIndex()));
+        assertEquals(TEN, newObj.get(b.getIndex()));
+    }
+
+    @Test
+    public void testLimitObjectiveCreatesConstraintExpression() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable v = model.addVariable("v");
+        v.weight(FIVE);
+
+        // limit the objective between 0 and 20
+        Expression limit = model.limitObjective(BigDecimal.ZERO, BigDecimal.valueOf(20));
+
+        // the limit expression must be stored under the internal key
+        assertNotNull(limit);
+        assertTrue(limit.isConstraint());
+
+        // lower / upper limits must be set as requested
+        assertEquals(BigDecimal.ZERO, limit.getLowerLimit());
+        assertEquals(BigDecimal.valueOf(20), limit.getUpperLimit());
+
+        // the original objective must still be unchanged
+        Expression obj = model.objective();
+        assertEquals(FIVE, obj.get(v.getIndex()));
+    }
+
+    @Test
+    public void testDescriptionCounts() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable x = model.addVariable("x").lower(ZERO).upper(TEN);
+        Variable y = model.addVariable("y").upper(FIVE); // only upper bound
+        Variable z = model.addVariable("z").lower(NEG).upper(POS); // both bounds
+
+        Expression e1 = model.addExpression("c1");
+        e1.set(x.getIndex(), ONE);
+        e1.upper(BigDecimal.valueOf(8)); // upper constraint
+
+        Expression e2 = model.addExpression("c2");
+        e2.set(y.getIndex(), ONE);
+        e2.lower(BigDecimal.ONE); // lower constraint
+
+        Expression e3 = model.addExpression("c3");
+        e3.set(z.getIndex(), ONE);
+        e3.lower(BigDecimal.ZERO).upper(BigDecimal.valueOf(5)); // equality (both limits)
+
+        Description d = model.describe();
+
+        // variables
+        assertEquals(3, d.nbVariables);
+        // bounds
+        assertEquals(2, d.nbLowerBounds); // x and z
+        assertEquals(3, d.nbUpperBounds); // x, y, z
+        assertEquals(1, d.nbEqualityBounds); // z (both limits)
+
+        // constraints
+        assertEquals(1, d.nbUpperConstraints);
+        assertEquals(1, d.nbLowerConstraints);
+        assertEquals(1, d.nbEqualityConstraints);
+    }
+
+    @Test
+    public void testIndexMappingsAfterFixingVariables() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable a = model.addVariable("a");
+        Variable b = model.addVariable("b");
+        Variable c = model.addVariable("c");
+
+        // fix variable b
+        b.lower(BigDecimal.valueOf(3)).upper(BigDecimal.valueOf(3));
+
+        // free‑variable indexes
+        int freeA = model.indexOfFreeVariable(a);
+        int freeB = model.indexOfFreeVariable(b);
+        int freeC = model.indexOfFreeVariable(c);
+
+        assertTrue(freeA >= 0);
+        assertEquals(-1, freeB); // fixed → not free
+        assertTrue(freeC >= 0);
+        assertEquals(2, model.indexOfFreeVariable()); // total free variables = 2
+    }
+
+    @Test
+    public void testCopyAndShallowCopyBehaviour() {
+        ExpressionsBasedModel original = new ExpressionsBasedModel();
+
+        Variable v1 = original.addVariable("v1").weight(ONE);
+        Variable v2 = original.addVariable("v2").weight(TWO);
+        original.addExpression("e1").set(v1.getIndex(), ONE).set(v2.getIndex(), TWO);
+
+        // deep copy
+        ExpressionsBasedModel copy = original.copy();
+        assertEquals(original.countVariables(), copy.countVariables());
+        assertEquals(original.countExpressions(), copy.countExpressions());
+
+        // change weight in copy – original must stay unchanged
+        copy.getVariable(0).weight(THREE);
+        assertEquals(ONE, original.getVariable(0).getContributionWeight());
+
+        // shallow copy (used for snapshot)
+        ExpressionsBasedModel shallow = original.copy(true, false);
+        assertTrue(shallow.isShallowCopy());
+
+        // modifying the shallow copy must affect the underlying variable objects
+        shallow.getVariable(1).weight(FIVE);
+        assertEquals(FIVE, original.getVariable(1).getContributionWeight());
+    }
+
+    @Test
+    public void testRelaxationAndIntegerDetection() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable intVar = model.addVariable("intVar").integer(true);
+        Variable freeVar = model.addVariable("freeVar");
+
+        assertTrue(model.isAnyVariableInteger());
+
+        // relax the model – integer flag should be cleared
+        model.relax();
+        assertFalse(model.isAnyVariableInteger());
+
+        // after a soft relaxation the model is marked as relaxed but integer flag stays
+        model.addVariable("softInt").integer(true);
+        model.relax(true);
+        assertTrue(model.isRelaxed());
+    }
+
+    @Test
+    public void testSimplifyRemovesRedundantConstraints() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // variable x fixed to 5
+        Variable x = model.addVariable("x").lower(BigDecimal.valueOf(5)).upper(BigDecimal.valueOf(5));
+
+        // constraint: x <= 5 (redundant because x is fixed)
+        Expression expr = model.addExpression("c");
+        expr.set(x.getIndex(), ONE);
+        expr.upper(BigDecimal.valueOf(5));
+
+        // before simplification the expression is present and not redundant
+        assertFalse(expr.isRedundant());
+
+        // run simplification – the presolvers should mark the expression as redundant
+        ExpressionsBasedModel simplified = model.simplify();
+
+        Expression simplifiedExpr = simplified.getExpression("c");
+        assertNotNull(simplifiedExpr);
+        assertTrue(simplifiedExpr.isRedundant());
+    }
+
+    @Test
+    public void testValidateWithFeasibleSolution() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        Variable a = model.addVariable("a").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        Variable b = model.addVariable("b").lower(BigDecimal.ONE).upper(BigDecimal.valueOf(3));
+
+        // simple linear constraint: a + b >= 4
+        Expression constr = model.addExpression("c");
+        constr.add(a, ONE);
+        constr.add(b, ONE);
+        constr.lower(BigDecimal.valueOf(4));
+
+        // a feasible solution: a = 2, b = 2
+        BigDecimal[] solutionArray = { new BigDecimal("2"), new BigDecimal("2") };
+        Access1D<BigDecimal> solution = Access1D.wrap(solutionArray);
+
+        assertTrue(model.validate(solution));
+    }
+
+    @Test
+    public void testAddSpecialOrderedSetAddsPresolver() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // create three binary variables
+        Variable v1 = model.addVariable("v1").binary();
+        Variable v2 = model.addVariable("v2").binary();
+        Variable v3 = model.addVariable("v3").binary();
+
+        int before = ExpressionsBasedModel.PRESOLVERS.size();
+
+        // add SOS with max 1 variable ON
+        model.addSpecialOrderedSet(java.util.Arrays.asList(v1, v2, v3), 1, 1);
+
+        int after = ExpressionsBasedModel.PRESOLVERS.size();
+
+        // a new presolver should have been added
+        assertEquals(before + 1, after);
+    }
+
+    @Test
+    public void testOptimisationSenseSetByMinimiseAndMaximise() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // no explicit call yet – sense is null
+        assertNull(model.getOptimisationSense());
+
+        // minimise()
+        model.minimise();
+        assertEquals(Optimisation.Sense.MIN, model.getOptimisationSense());
+
+        // maximise()
+        model.maximise();
+        assertEquals(Optimisation.Sense.MAX, model.getOptimisationSense());
+    }
+
+    @Test
+    public void testFileFormatDetection() {
+        // ensure that the FileFormat enum correctly recognises extensions
+        File ebmFile = new File("model.ebm");
+        File mpsFile = new File("model.mps");
+        File sifFile = new File("model.sif");
+
+        assertEquals(ExpressionsBasedModel.FileFormat.EBM, ExpressionsBasedModel.FileFormat.from(ebmFile));
+        assertEquals(ExpressionsBasedModel.FileFormat.MPS, ExpressionsBasedModel.FileFormat.from(mpsFile));
+        assertEquals(ExpressionsBasedModel.FileFormat.MPS, ExpressionsBasedModel.FileFormat.from(sifFile));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testFileFormatFromInvalidPathThrows() {
+        ExpressionsBasedModel.FileFormat.from("unknown.xyz");
+    }
+
+    @Test
+    public void testObjectiveConstantAccumulation() {
+        ExpressionsBasedModel model = new ExpressionsBasedModel();
+
+        // add a constant term via addObjectiveConstant (internal method)
+        // use reflection because the method is package‑private
+        try {
+            java.lang.reflect.Method m = ExpressionsBasedModel.class.getDeclaredMethod("addObjectiveConstant", BigDecimal.class);
+            m.setAccessible(true);
+            m.invoke(model, new BigDecimal("10"));
+            m.invoke(model, new BigDecimal("-3"));
+        } catch (Exception e) {
+            fail("Reflection failed: " + e);
+        }
+
+        // the objective constant should now be 7
+        try {
+            java.lang.reflect.Method getter = ExpressionsBasedModel.class.getDeclaredMethod("getObjectiveConstant");
+            getter.setAccessible(true);
+            BigDecimal constant = (BigDecimal) getter.invoke(model);
+            assertEquals(new BigDecimal("7"), constant);
+        } catch (Exception e) {
+            fail("Reflection failed: " + e);
+        }
+    }
+}

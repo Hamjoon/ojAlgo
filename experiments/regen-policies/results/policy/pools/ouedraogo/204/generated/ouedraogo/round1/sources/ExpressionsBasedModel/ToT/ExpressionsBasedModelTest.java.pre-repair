@@ -1,0 +1,882 @@
+package org.ojalgo.optimisation;
+
+import static org.junit.Assert.*;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.junit.Before;
+import org.junit.Test;
+import org.ojalgo.type.context.NumberContext;
+import org.ojalgo.netio.BasicLogger;
+
+/**
+ * JUnit‑4 test suite for {@link ExpressionsBasedModel}.
+ *
+ * <p>
+ * The tests cover typical usage, edge cases and error scenarios for the public API of
+ * {@code ExpressionsBasedModel}.  No external solvers are invoked – the tests focus on model
+ * construction, indexing, description, validation and helper methods that can be exercised
+ * without requiring a concrete {@link Optimisation.Solver} implementation.
+ * </p>
+ */
+public class ExpressionsBasedModelTest {
+
+    private ExpressionsBasedModel model;
+
+    @Before
+    public void setUp() {
+        model = new ExpressionsBasedModel();
+    }
+
+    /** Simple variable and expression creation, and basic getters. */
+    @Test
+    public void testAddVariableAndExpression() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // give them contribution weights
+        x.weight(BigDecimal.ONE);
+        y.weight(BigDecimal.valueOf(2));
+
+        // create an expression that uses both variables
+        Expression expr = model.addExpression("e1");
+        expr.add(x, BigDecimal.ONE);
+        expr.add(y, BigDecimal.valueOf(3));
+
+        // verify that the model contains the variables and expression
+        assertEquals(2, model.countVariables());
+        assertEquals(1, model.countExpressions());
+        assertSame(x, model.getVariable(0));
+        assertSame(y, model.getVariable(1));
+        assertSame(expr, model.getExpression("e1"));
+    }
+
+    /** Objective aggregation – the generated objective must reflect variable and expression weights. */
+    @Test
+    public void testObjectiveAggregation() {
+        Variable a = model.addVariable("a").weight(BigDecimal.valueOf(5));
+        Variable b = model.addVariable("b"); // no weight
+
+        // expression with its own contribution weight
+        Expression e = model.addExpression("e");
+        e.weight(BigDecimal.valueOf(2));
+        e.add(a, BigDecimal.ONE);
+        e.add(b, BigDecimal.valueOf(4));
+
+        // expected objective: 5*a + 2*(1*a + 4*b) = (5+2)*a + 8*b = 7*a + 8*b
+        Expression obj = model.objective();
+
+        // check linear coefficients
+        assertEquals(BigDecimal.valueOf(7), obj.get(a.getIndex()));
+        assertEquals(BigDecimal.valueOf(8), obj.get(b.getIndex()));
+        assertEquals(BigDecimal.ZERO, obj.getConstant()); // no constant added
+    }
+
+    /** Verify that {@link Description} correctly counts variable/constraint categories. */
+    @Test
+    public void testDescriptionCounts() {
+        Variable v1 = model.addVariable("v1").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        Variable v2 = model.addVariable("v2").lower(BigDecimal.ONE); // only lower bound
+        Variable v3 = model.addVariable("v3").upper(BigDecimal.valueOf(5)); // only upper bound
+
+        // expression constraints
+        Expression c1 = model.addExpression("c1").lower(BigDecimal.valueOf(3)).upper(BigDecimal.valueOf(7));
+        c1.add(v1, BigDecimal.ONE);
+        Expression c2 = model.addExpression("c2").upper(BigDecimal.valueOf(4));
+        c2.add(v2, BigDecimal.ONE);
+        Expression c3 = model.addExpression("c3").lower(BigDecimal.valueOf(2));
+        c3.add(v3, BigDecimal.ONE);
+
+        ExpressionsBasedModel.Description desc = model.describe();
+
+        // variables
+        assertEquals(3, desc.nbVariables);
+        // all three have at least one bound
+        assertEquals(0, desc.nbEqualityBounds);
+        assertEquals(1, desc.nbLowerBounds); // v1 and v2 -> counted as lower bounds (v1 also upper)
+        assertEquals(2, desc.nbUpperBounds); // v1 and v3
+        // constraints
+        assertEquals(1, desc.nbEqualityConstraints);
+        assertEquals(2, desc.nbLowerConstraints);
+        assertEquals(2, desc.nbUpperConstraints);
+    }
+
+    /** Index mapping for free, integer, positive and negative variables. */
+    @Test
+    public void testVariableIndexMappings() {
+        Variable p = model.addVariable("p").upper(BigDecimal.TEN); // positive
+        Variable n = model.addVariable("n").lower(BigDecimal.valueOf(-5)); // negative
+        Variable i = model.addVariable("i").integer(); // integer (also free)
+
+        // free indices
+        assertEquals(0, model.indexOfFreeVariable(p));
+        assertEquals(1, model.indexOfFreeVariable(n));
+        assertEquals(2, model.indexOfFreeVariable(i));
+
+        // integer indices (only i)
+        assertEquals(-1, model.indexOfIntegerVariable(p));
+        assertEquals(-1, model.indexOfIntegerVariable(n));
+        assertEquals(0, model.indexOfIntegerVariable(i));
+
+        // positive indices (p only)
+        assertEquals(0, model.indexOfPositiveVariable(p));
+        assertEquals(-1, model.indexOfPositiveVariable(n));
+        assertEquals(-1, model.indexOfPositiveVariable(i));
+
+        // negative indices (n only)
+        assertEquals(0, model.indexOfNegativeVariable(n));
+        assertEquals(-1, model.indexOfNegativeVariable(p));
+        assertEquals(-1, model.indexOfNegativeVariable(i));
+    }
+
+    /** Integer detection and relaxation behaviour. */
+    @Test
+    public void testIntegerDetectionAndRelaxation() {
+        Variable intVar = model.addVariable("intVar").integer();
+        Variable freeVar = model.addVariable("freeVar");
+
+        assertTrue("Model should report integer variables", model.isAnyVariableInteger());
+
+        // Relaxation removes integer flag
+        model.relax();
+        assertFalse("After relaxation integer flag should be cleared", intVar.isInteger());
+
+        // Soft relaxation keeps the flag but marks model as relaxed
+        model.relax(true);
+        assertTrue("Soft relaxation keeps integer flag", intVar.isInteger());
+        assertTrue("Model should be marked as relaxed", model.isRelaxed());
+    }
+
+    /** limitObjective creates a constraint expression when the objective is linear. */
+    @Test
+    public void testLimitObjectiveCreatesConstraint() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        Expression obj = model.objective(); // linear objective
+
+        // impose a bound on the objective
+        Expression limited = model.limitObjective(BigDecimal.ZERO, BigDecimal.TEN);
+
+        // the returned expression should be the same as the generated constraint
+        assertNotNull(limited);
+        assertTrue(limited.isConstraint());
+        assertEquals(BigDecimal.ZERO, limited.getLowerLimit());
+        assertEquals(BigDecimal.TEN, limited.getUpperLimit());
+
+        // the constraint must have the same linear coefficient as the objective
+        assertEquals(BigDecimal.ONE, limited.get(x.getIndex()));
+    }
+
+    /** getVariableValues returns a feasible solution when all variables have sufficient information. */
+    @Test
+    public void testGetVariableValuesAllInfo() {
+        // variable with explicit value
+        Variable v1 = model.addVariable("v1").value(BigDecimal.valueOf(3));
+
+        // variable with bounds only – should be set to midpoint
+        Variable v2 = model.addVariable("v2").lower(BigDecimal.ZERO).upper(BigDecimal.valueOf(10));
+
+        // variable with only lower bound – should be set to lower bound
+        Variable v3 = model.addVariable("v3").lower(BigDecimal.valueOf(5));
+
+        Optimisation.Result result = model.getVariableValues();
+
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        assertEquals(3, result.get(0).intValue()); // v1
+        assertEquals(5, result.get(1).intValue()); // midpoint of 0 and 10
+        assertEquals(5, result.get(2).intValue()); // lower bound
+    }
+
+    /** getVariableValues reports INFEASIBLE when a variable lacks any information. */
+    @Test
+    public void testGetVariableValuesMissingInfo() {
+        // variable without value or bounds
+        model.addVariable("x");
+
+        Optimisation.Result result = model.getVariableValues();
+
+        assertEquals(Optimisation.State.INFEASIBLE, result.getState());
+    }
+
+    /** copy() creates an independent model; modifications on the copy do not affect the original. */
+    @Test
+    public void testCopyIndependence() {
+        Variable orig = model.addVariable("orig").lower(BigDecimal.ZERO);
+        ExpressionsBasedModel copy = model.copy();
+
+        // modify copy – add a new variable
+        copy.addVariable("newVar").upper(BigDecimal.ONE);
+
+        // original should still have only one variable
+        assertEquals(1, model.countVariables());
+        assertEquals(2, copy.countVariables());
+
+        // original variable should retain its lower bound
+        assertTrue(model.getVariable(0).isLowerLimitSet());
+        assertFalse(copy.getVariable(0).isLowerLimitSet()); // copy is shallow – bounds are not copied
+    }
+
+    /** Adding a special ordered set with a non‑binary variable must throw a ProgrammingError. */
+    @Test(expected = RuntimeException.class) // ProgrammingError extends RuntimeException
+    public void testAddSpecialOrderedSetInvalidVariable() {
+        Variable v = model.addVariable("v"); // not binary
+        model.addSpecialOrderedSet(Collections.singletonList(v), 1, 2);
+    }
+
+    /** setKnownSolution validates the supplied solution before storing it. */
+    @Test
+    public void testSetKnownSolutionValidation() {
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        Variable y = model.addVariable("y").lower(BigDecimal.ZERO).upper(BigDecimal.ONE);
+
+        // a feasible solution (x=5, y=1)
+        Optimisation.Result feasible = Optimisation.Result.of(Optimisation.State.OPTIMAL, 0.0,
+                new double[] { 5.0, 1.0 });
+
+        // should not throw
+        model.setKnownSolution(feasible);
+        assertSame(feasible, model.getKnownSolution());
+    }
+
+    /** setKnownSolution must reject a non‑optimal solution. */
+    @Test(expected = RuntimeException.class) // ProgrammingError
+    public void testSetKnownSolutionNonOptimal() {
+        Variable x = model.addVariable("x");
+        Optimisation.Result notOptimal = Optimisation.Result.of(Optimisation.State.FEASIBLE, 0.0,
+                new double[] { 0.0 });
+        model.setKnownSolution(notOptimal);
+    }
+
+    /** simplify() runs presolve and returns a shallow copy; ensure it does not throw. */
+    @Test
+    public void testSimplifyRunsPresolve() {
+        Variable a = model.addVariable("a").lower(BigDecimal.ZERO);
+        Variable b = model.addVariable("b").upper(BigDecimal.valueOf(5));
+
+        Expression e = model.addExpression("e");
+        e.add(a, BigDecimal.ONE);
+        e.add(b, BigDecimal.ONE);
+        e.upper(BigDecimal.valueOf(4)); // feasible constraint
+
+        // simplify should succeed and produce a new model
+        ExpressionsBasedModel simplified = model.simplify();
+        assertNotNull(simplified);
+        assertEquals(2, simplified.countVariables());
+        assertEquals(1, simplified.countExpressions());
+    }
+
+    /** isInfeasible() detects contradictory constraints. */
+    @Test
+    public void testInfeasibilityDetection() {
+        Variable x = model.addVariable("x");
+        Expression expr = model.addExpression("conflict");
+        expr.lower(BigDecimal.ONE).upper(BigDecimal.ZERO); // lower > upper -> infeasible
+        assertTrue("Model should be marked infeasible", model.isInfeasible());
+    }
+
+    /** Adding a variable after a shallow copy must raise IllegalStateException. */
+    @Test(expected = IllegalStateException.class)
+    public void testAddVariableAfterShallowCopy() {
+        ExpressionsBasedModel shallow = model.copy(true, false); // shallow copy
+        shallow.addVariable("new"); // should fail
+    }
+
+    /** verify that isAnyVariableFixed works correctly. */
+    @Test
+    public void testIsAnyVariableFixed() {
+        Variable v1 = model.addVariable("v1").value(BigDecimal.ONE);
+        Variable v2 = model.addVariable("v2");
+        assertTrue(model.isAnyVariableFixed());
+
+        // after resetting the fixed variable, result should be false
+        v1.setValue(null);
+        assertFalse(model.isAnyVariableFixed());
+    }
+
+    /** validate(Access1D) returns true for a feasible solution and false otherwise. */
+    @Test
+    public void testValidateSolution() {
+        Variable x = model.addVariable("x").lower(BigDecimal.ZERO).upper(BigDecimal.TEN);
+        Variable y = model.addVariable("y").lower(BigDecimal.ONE).upper(BigDecimal.ONE); // fixed at 1
+
+        // feasible point (x=5, y=1)
+        Access1D<BigDecimal> feasible = Access1D.wrap(new BigDecimal[] { BigDecimal.valueOf(5), BigDecimal.ONE });
+        assertTrue(model.validate(feasible));
+
+        // infeasible point (x=-1 violates lower bound)
+        Access1D<BigDecimal> infeasible = Access1D.wrap(new BigDecimal[] { BigDecimal.valueOf(-1), BigDecimal.ONE });
+        assertFalse(model.validate(infeasible));
+    }
+
+    /** Ensure that toString() produces a non‑empty representation containing variable names. */
+    @Test
+    public void testToStringContainsVariables() {
+        model.addVariable("alpha");
+        model.addVariable("beta");
+        String repr = model.toString();
+        assertTrue(repr.contains("alpha"));
+        assertTrue(repr.contains("beta"));
+        assertTrue(repr.startsWith("############################################"));
+        assertTrue(repr.endsWith("############################################\n"));
+    }
+
+    /** Test that adding an expression with the same name overwrites the previous one. */
+    @Test
+    public void testAddExpressionOverwrite() {
+        Expression e1 = model.addExpression("dup");
+        e1.lower(BigDecimal.ZERO);
+        Expression e2 = model.addExpression("dup"); // same name
+        e2.upper(BigDecimal.TEN);
+
+        // The map should contain the second expression
+        Expression retrieved = model.getExpression("dup");
+        assertSame(e2, retrieved);
+        assertTrue(retrieved.isUpperConstraint());
+        assertFalse(retrieved.isLowerConstraint());
+    }
+
+    /** Test that getFixedVariables reflects the current fixed set. */
+    @Test
+    public void testGetFixedVariables() {
+        Variable a = model.addVariable("a").value(BigDecimal.ONE);
+        Variable b = model.addVariable("b"); // not fixed
+        Set<IntIndex> fixed = model.getFixedVariables();
+        assertEquals(1, fixed.size());
+        assertTrue(fixed.contains(a.getIndex()));
+        assertFalse(fixed.contains(b.getIndex()));
+    }
+
+    /** Test that presolve correctly marks a zero‑one‑two expression as redundant. */
+    @Test
+    public void testPresolveZeroOneTwoRedundant() {
+        Variable x = model.addVariable("x").binary();
+        Variable y = model.addVariable("y").binary();
+
+        // expression forces x + y = 0 (both must be zero)
+        Expression expr = model.addExpression("zero");
+        expr.add(x, BigDecimal.ONE);
+        expr.add(y, BigDecimal.ONE);
+        expr.upper(BigDecimal.ZERO);
+        expr.lower(BigDecimal.ZERO);
+
+        // run simplify (which triggers presolve)
+        ExpressionsBasedModel simplified = model.simplify();
+
+        // after simplification the expression should be marked redundant
+        Expression after = simplified.getExpression("zero");
+        assertNotNull(after);
+        assertTrue(after.isRedundant());
+    }
+
+    /** Verify that isAnyExpressionQuadratic returns true only when a quadratic term is present. */
+    @Test
+    public void testQuadraticDetection() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // linear expression – should be false
+        Expression lin = model.addExpression("lin");
+        lin.add(x, BigDecimal.ONE);
+        lin.add(y, BigDecimal.ONE);
+        assertFalse(model.isAnyExpressionQuadratic());
+
+        // quadratic expression – should be true
+        Expression quad = model.addExpression("quad");
+        quad.add(x, y, BigDecimal.ONE);
+        assertTrue(model.isAnyExpressionQuadratic());
+    }
+
+    /** Ensure that getIntegration() throws when no suitable integration is registered. */
+    @Test(expected = RuntimeException.class) // ProgrammingError
+    public void testGetIntegrationNoSolver() {
+        // Clear all integrations to force the error path
+        ExpressionsBasedModel.clearIntegrations();
+        // The model contains no integer variables and no quadratic terms,
+        // but we also clear the built‑in integrations, so getIntegration() must fail.
+        model.getIntegration();
+    }
+
+    /** Validate that the model reports unbounded when a variable has no limits. */
+    @Test
+    public void testUnboundedVariableDetection() {
+        model.addVariable("free"); // no bounds
+        assertTrue("Model should detect an unbounded variable", model.isUnbounded());
+    }
+
+    /** Test that relax(true) (soft relaxation) keeps integer flag but marks model as relaxed. */
+    @Test
+    public void testSoftRelaxation() {
+        Variable iv = model.addVariable("iv").integer();
+        assertTrue(iv.isInteger());
+
+        model.relax(true);
+        assertTrue(iv.isInteger()); // still integer
+        assertTrue(model.isRelaxed()); // model flagged as relaxed
+    }
+
+    /** Ensure that calling minimise() without a capable solver throws a ProgrammingError. */
+    @Test(expected = RuntimeException.class) // ProgrammingError
+    public void testMinimiseWithoutSolver() {
+        // Remove all integrations to guarantee failure
+        ExpressionsBasedModel.clearIntegrations();
+        model.minimise();
+    }
+
+    /** Test that the model correctly reports being fixed when all variables have values. */
+    @Test
+    public void testIsFixed() {
+        model.addVariable("a").value(BigDecimal.ONE);
+        model.addVariable("b").value(BigDecimal.ZERO);
+        assertTrue("All variables are fixed", model.isFixed());
+
+        // make one variable free again
+        model.getVariable(0).setValue(null);
+        assertFalse("Not all variables are fixed now", model.isFixed());
+    }
+
+    /** Test that getVariableValues respects the model's feasibility context. */
+    @Test
+    public void testVariableValuesRespectsFeasibilityContext() {
+        // Tight feasibility context (tolerance 0)
+        model.options.feasibility = NumberContext.of(0);
+        Variable v = model.addVariable("v").lower(BigDecimal.ONE).upper(BigDecimal.ONE);
+        Optimisation.Result result = model.getVariableValues();
+
+        // With zero tolerance the exact bound should be accepted
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        assertEquals(BigDecimal.ONE, result.get(0));
+    }
+
+    /** Test that addExpression(String) creates an expression with the given name. */
+    @Test
+    public void testAddExpressionWithName() {
+        Expression e = model.addExpression("myExpr");
+        assertNotNull(e);
+        assertEquals("myExpr", e.getName());
+        assertSame(e, model.getExpression("myExpr"));
+    }
+
+    /** Test that addVariable(String) creates a variable with the given name. */
+    @Test
+    public void testAddVariableWithName() {
+        Variable v = model.addVariable("myVar");
+        assertNotNull(v);
+        assertEquals("myVar", v.getName());
+        assertSame(v, model.getVariable(0));
+    }
+
+    /** Test that getExpressions returns an unmodifiable collection. */
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetExpressionsUnmodifiable() {
+        model.addExpression("e");
+        model.getExpressions().add(model.newExpression("illegal"));
+    }
+
+    /** Test that getVariables returns an unmodifiable list. */
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetVariablesUnmodifiable() {
+        model.addVariable("v");
+        model.getVariables().add(model.newVariable("illegal"));
+    }
+
+    /** Test that the model correctly identifies when it contains no integer variables. */
+    @Test
+    public void testNoIntegerVariables() {
+        model.addVariable("x");
+        model.addVariable("y");
+        assertFalse("Model should report no integer variables", model.isAnyVariableInteger());
+    }
+
+    /** Test that the model correctly identifies when it contains integer variables. */
+    @Test
+    public void testHasIntegerVariables() {
+        model.addVariable("z").integer();
+        assertTrue("Model should report integer variables", model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's getKnownSolution returns null when not set. */
+    @Test
+    public void testGetKnownSolutionInitiallyNull() {
+        assertNull(model.getKnownSolution());
+    }
+
+    /** Test that the model's isInfeasible flag is lazy – it is only set after detection. */
+    @Test
+    public void testLazyInfeasibilityFlag() {
+        assertFalse(model.isInfeasible()); // initially false
+        // create infeasible constraint
+        Expression e = model.addExpression("bad");
+        e.lower(BigDecimal.ONE).upper(BigDecimal.ZERO);
+        assertTrue(model.isInfeasible()); // now true
+    }
+
+    /** Test that the model's toString contains the objective constant when set. */
+    @Test
+    public void testToStringShowsObjectiveConstant() {
+        model.addObjectiveConstant(BigDecimal.valueOf(42));
+        String s = model.toString();
+        assertTrue(s.contains("42"));
+    }
+
+    /** Test that the model's presolve removes redundant constraints (zero‑one‑two case). */
+    @Test
+    public void testPresolveRemovesZeroOneTwo() {
+        Variable a = model.addVariable("a").binary();
+        Variable b = model.addVariable("b").binary();
+
+        // a + b <= 0 forces both to zero -> redundant after presolve
+        Expression expr = model.addExpression("zeroSum");
+        expr.add(a, BigDecimal.ONE);
+        expr.add(b, BigDecimal.ONE);
+        expr.upper(BigDecimal.ZERO);
+
+        model.simplify(); // triggers presolve
+
+        Expression after = model.getExpression("zeroSum");
+        // The expression should be marked as redundant
+        assertTrue(after.isRedundant());
+    }
+
+    /** Test that the model correctly reports being referenced when a variable is used in an expression. */
+    @Test
+    public void testVariableReferenceTracking() {
+        Variable v = model.addVariable("v");
+        Expression e = model.addExpression("e");
+        e.add(v, BigDecimal.ONE);
+        assertTrue("Variable should be referenced after being added to an expression", model.isReferenced(v));
+    }
+
+    /** Test that adding a variable with an existing index is prevented in a shallow copy. */
+    @Test(expected = IllegalStateException.class)
+    public void testShallowCopyVariableModificationForbidden() {
+        ExpressionsBasedModel shallow = model.copy(true, false);
+        // attempt to add another variable – should fail
+        shallow.addVariable("newVar");
+    }
+
+    /** Test that the model's isIntegrationSwitch works with a custom property. */
+    @Test
+    public void testIntegrationSwitch() {
+        // set a switch via the Integration API (using a dummy integration)
+        ExpressionsBasedModel.Integration<?> dummy = new ExpressionsBasedModel.Integration<Optimisation.Solver>() {
+            @Override public Optimisation.Solver build(ExpressionsBasedModel m) { return null; }
+            @Override public boolean isCapable(ExpressionsBasedModel m) { return false; }
+        };
+        dummy.setSwitch(model, ExpressionsBasedModel.IntegrationProperty.TEMPORARY, true);
+        assertTrue(model.isIntegrationSwitch(ExpressionsBasedModel.IntegrationProperty.TEMPORARY));
+    }
+
+    /** Test that the model's getReferences returns an empty set initially. */
+    @Test
+    public void testGetReferencesInitiallyEmpty() {
+        assertTrue(model.getReferences().isEmpty());
+    }
+
+    /** Test that the model's isAnyConstraintQuadratic correctly identifies quadratic constraints. */
+    @Test
+    public void testAnyConstraintQuadraticDetection() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // linear constraint – should be false
+        Expression lin = model.addExpression("lin");
+        lin.add(x, BigDecimal.ONE);
+        lin.lower(BigDecimal.ZERO);
+        assertFalse(model.isAnyConstraintQuadratic());
+
+        // quadratic constraint – should be true
+        Expression quad = model.addExpression("quad");
+        quad.add(x, y, BigDecimal.ONE);
+        quad.upper(BigDecimal.TEN);
+        assertTrue(model.isAnyConstraintQuadratic());
+    }
+
+    /** Test that the model's isAnyObjectiveQuadratic works as expected. */
+    @Test
+    public void testAnyObjectiveQuadraticDetection() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+
+        // linear objective – false
+        model.objective().set(x.getIndex(), BigDecimal.ONE);
+        assertFalse(model.isAnyObjectiveQuadratic());
+
+        // add a quadratic expression marked as objective
+        Expression quadObj = model.addExpression("quadObj");
+        quadObj.weight(BigDecimal.ONE);
+        quadObj.add(x, y, BigDecimal.ONE);
+        assertTrue(model.isAnyObjectiveQuadratic());
+    }
+
+    /** Test that the model's isAnyVariableFixed works when a variable is fixed via value(). */
+    @Test
+    public void testAnyVariableFixedDetection() {
+        model.addVariable("a");
+        Variable b = model.addVariable("b").value(BigDecimal.ONE);
+        assertTrue(model.isAnyVariableFixed());
+
+        // clear the fixed value
+        b.setValue(null);
+        assertFalse(model.isAnyVariableFixed());
+    }
+
+    /** Test that the model's getVariableValues respects the objective constant. */
+    @Test
+    public void testVariableValuesObjectiveConstant() {
+        model.addVariable("x").weight(BigDecimal.ONE);
+        model.addObjectiveConstant(BigDecimal.valueOf(5));
+
+        Optimisation.Result result = model.getVariableValues();
+        // No variable values are set, but the objective constant does not affect feasibility
+        assertEquals(Optimisation.State.FEASIBLE, result.getState());
+        // objective value should be constant (5)
+        assertEquals(5.0, model.objective().evaluate(result).doubleValue(), 1e-12);
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after a hard relaxation. */
+    @Test
+    public void testIntegerFlagAfterHardRelax() {
+        model.addVariable("intVar").integer();
+        assertTrue(model.isAnyVariableInteger());
+        model.relax(); // hard relaxation
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true after soft relaxation (soft = true). */
+    @Test
+    public void testIntegerFlagAfterSoftRelax() {
+        model.addVariable("intVar").integer();
+        model.relax(true); // soft relaxation
+        assertTrue(model.isAnyVariableInteger());
+        assertTrue(model.isRelaxed());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after all integer variables are fixed. */
+    @Test
+    public void testIntegerVariablesAllFixed() {
+        Variable iv = model.addVariable("iv").integer().value(BigDecimal.ONE);
+        assertFalse(model.isAnyVariableInteger()); // fixed integer variables are ignored
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true when at least one integer variable is free. */
+    @Test
+    public void testIntegerVariablesSomeFree() {
+        Variable iv1 = model.addVariable("iv1").integer();
+        Variable iv2 = model.addVariable("iv2").integer().value(BigDecimal.ONE);
+        assertTrue(model.isAnyVariableInteger()); // iv1 is free
+    }
+
+    /** Test that the model's isAnyConstraintQuadratic returns false when no constraints are quadratic. */
+    @Test
+    public void testConstraintQuadraticWhenNone() {
+        Variable x = model.addVariable("x");
+        Expression expr = model.addExpression("c");
+        expr.add(x, BigDecimal.ONE);
+        expr.upper(BigDecimal.TEN);
+        assertFalse(model.isAnyConstraintQuadratic());
+    }
+
+    /** Test that the model's isAnyExpressionQuadratic returns true when a quadratic expression is present even if not a constraint. */
+    @Test
+    public void testExpressionQuadraticWhenNotConstraint() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+        Expression expr = model.addExpression("obj");
+        expr.weight(BigDecimal.ONE);
+        expr.add(x, y, BigDecimal.ONE); // quadratic term, marked as objective
+        assertTrue(model.isAnyExpressionQuadratic());
+    }
+
+    /** Test that the model's isAnyExpressionQuadratic returns false for purely linear model. */
+    @Test
+    public void testExpressionQuadraticLinearModel() {
+        Variable x = model.addVariable("x");
+        Expression expr = model.addExpression("lin");
+        expr.add(x, BigDecimal.ONE);
+        assertFalse(model.isAnyExpressionQuadratic());
+    }
+
+    /** Test that the model's isAnyObjectiveQuadratic returns false when objective has no quadratic term. */
+    @Test
+    public void testObjectiveQuadraticFalse() {
+        Variable x = model.addVariable("x").weight(BigDecimal.ONE);
+        assertFalse(model.isAnyObjectiveQuadratic());
+    }
+
+    /** Test that the model's isAnyObjectiveQuadratic returns true when objective contains quadratic term. */
+    @Test
+    public void testObjectiveQuadraticTrue() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+        Expression obj = model.addExpression("obj");
+        obj.weight(BigDecimal.ONE);
+        obj.add(x, y, BigDecimal.ONE);
+        assertTrue(model.isAnyObjectiveQuadratic());
+    }
+
+    /** Test that the model's isAnyConstraintQuadratic returns true when a quadratic constraint is added. */
+    @Test
+    public void testConstraintQuadraticTrue() {
+        Variable x = model.addVariable("x");
+        Variable y = model.addVariable("y");
+        Expression c = model.addExpression("c");
+        c.add(x, y, BigDecimal.ONE);
+        c.upper(BigDecimal.TEN);
+        assertTrue(model.isAnyConstraintQuadratic());
+    }
+
+    /** Test that the model's isAnyVariableFixed returns false when no variable is fixed. */
+    @Test
+    public void testAnyVariableFixedFalse() {
+        model.addVariable("a");
+        model.addVariable("b");
+        assertFalse(model.isAnyVariableFixed());
+    }
+
+    /** Test that the model's getVariableValues returns APPROXIMATE when solution validation fails. */
+    @Test
+    public void testVariableValuesApproximateState() {
+        // create a variable with a narrow feasible interval
+        Variable v = model.addVariable("v").lower(BigDecimal.valueOf(0)).upper(BigDecimal.valueOf(1));
+        // manually set a value that violates the feasibility tolerance
+        v.setValue(BigDecimal.valueOf(2));
+        Optimisation.Result result = model.getVariableValues();
+        assertEquals(Optimisation.State.APPROXIMATE, result.getState());
+    }
+
+    /** Test that the model's isAnyVariableFixed returns true when a variable has a fixed value via lower=upper. */
+    @Test
+    public void testVariableFixedViaEqualityConstraint() {
+        Variable v = model.addVariable("v").lower(BigDecimal.valueOf(3)).upper(BigDecimal.valueOf(3));
+        assertTrue(v.isEqualityConstraint());
+        assertTrue(model.isAnyVariableFixed());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false when model is relaxed. */
+    @Test
+    public void testIntegerDetectionWhenRelaxed() {
+        model.addVariable("intVar").integer();
+        model.relax();
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after all integer variables are fixed, even when not relaxed. */
+    @Test
+    public void testIntegerDetectionAllFixed() {
+        model.addVariable("intVar").integer().value(BigDecimal.ONE);
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true when at least one integer variable is free, regardless of other fixed integer variables. */
+    @Test
+    public void testIntegerDetectionMixed() {
+        model.addVariable("intVar1").integer(); // free
+        model.addVariable("intVar2").integer().value(BigDecimal.ONE); // fixed
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after calling hard relax on a model that originally had integer variables. */
+    @Test
+    public void testHardRelaxClearsIntegerFlag() {
+        model.addVariable("intVar").integer();
+        model.relax(); // hard relax
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true after soft relax, keeping integer flag. */
+    @Test
+    public void testSoftRelaxKeepsIntegerFlag() {
+        model.addVariable("intVar").integer();
+        model.relax(true); // soft relax
+        assertTrue(model.isAnyVariableInteger());
+        assertTrue(model.isRelaxed());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after hard relaxation even if integer variables were previously added. */
+    @Test
+    public void testHardRelaxAfterIntegerVariables() {
+        model.addVariable("intVar").integer();
+        model.relax(); // hard relax
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after all integer variables are fixed, even after soft relaxation. */
+    @Test
+    public void testSoftRelaxAllIntegersFixed() {
+        model.addVariable("intVar").integer().value(BigDecimal.ONE);
+        model.relax(true); // soft relax
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true after adding a free integer variable, even after soft relaxation. */
+    @Test
+    public void testSoftRelaxWithFreeInteger() {
+        model.addVariable("intVar").integer();
+        model.relax(true); // soft relax
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after calling hard relaxation, even if integer variables exist. */
+    @Test
+    public void testHardRelaxDisablesIntegerDetection() {
+        model.addVariable("intVar").integer();
+        model.relax(); // hard relax
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true after adding an integer variable, before any relaxation. */
+    @Test
+    public void testIntegerDetectionBeforeRelaxation() {
+        model.addVariable("intVar").integer();
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false when the model has no variables at all. */
+    @Test
+    public void testIntegerDetectionNoVariables() {
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false when all variables are binary (binary is a subclass of integer). */
+    @Test
+    public void testBinaryVariablesAreInteger() {
+        model.addVariable("b1").binary();
+        model.addVariable("b2").binary();
+        // binary variables are also integer, so detection should be true
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after converting binary variables to non‑integer via relax(). */
+    @Test
+    public void testRelaxBinaryVariables() {
+        model.addVariable("b").binary();
+        model.relax();
+        assertFalse(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns true after adding a binary variable, before relaxation. */
+    @Test
+    public void testBinaryVariableIntegerDetection() {
+        model.addVariable("b").binary();
+        assertTrue(model.isAnyVariableInteger());
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after soft relaxation of binary variables. */
+    @Test
+    public void testSoftRelaxBinaryVariables() {
+        model.addVariable("b").binary();
+        model.relax(true);
+        assertTrue(model.isAnyVariableInteger()); // soft relaxation keeps integer flag
+    }
+
+    /** Test that the model's isAnyVariableInteger returns false after hard relaxation of binary variables. */
+    @Test
+    public void testHardRelaxBinaryVariables() {
+        model.addVariable("b").binary();
+        model.relax();
+        assertFalse(model.isAnyVariableInteger());
+    }
+}
